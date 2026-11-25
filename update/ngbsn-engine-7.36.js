@@ -17,7 +17,7 @@
 (function (Scratch) {
   // version del motor y de la API de bloques (la que esperan los bloques del proyecto .sb3). El cargador de
   // actualizaciones (updater.js, al final) las mira antes de arrancar el motor
-  const NGBSN_ENGINE_VERSION = '7.35';
+  const NGBSN_ENGINE_VERSION = '7.36';
   const NGBSN_API_BLOQUES = 1;
   const NGBSN_ENGINE = function (Scratch) {
 
@@ -15983,7 +15983,7 @@ registerProcessor('ngbsn-out', NgbsnOut);
         const cd = ((ce >> 22) & 3) * 4, ad = ((ae >> 22) & 3) * 4 + 3;
         L.push('R' + cd + ' = c0; R' + (cd + 1) + ' = c1; R' + (cd + 2) + ' = c2; R' + ad + ' = ca; }');
       });
-      L.push('const ra = R' + st.outA + ', Aa = ra < 0 ? 0 : ra > 1 ? 1 : ra;');
+      L.push('const ra = R' + st.outA + '; let Aa = ra < 0 ? 0 : ra > 1 ? 1 : ra;');
       if (!st.alwaysA) {
         const r0 = acmp(st.comp0, 'ref0'), r1 = acmp(st.comp1, 'ref1');
         const pass = ['(' + r0 + ') && (' + r1 + ')', '(' + r0 + ') || (' + r1 + ')', '(' + r0 + ') !== (' + r1 + ')', '(' + r0 + ') === (' + r1 + ')'][st.aLogic];
@@ -16002,11 +16002,13 @@ registerProcessor('ngbsn-out', NgbsnOut);
       L.push('const dst = efb[i];');
       if (st.blend) {
         L.push('{ const dr = (dst & 255) / 255, dg = ((dst >> 8) & 255) / 255, db = ((dst >> 16) & 255) / 255, da = ' + (st.pfmt === 1 ? '(dst >>> 24) / 255' : '1') + ';');
-        if (st.sub) L.push('Rr = cl(dr - Rr); Gg = cl(dg - Gg); Bb = cl(db - Bb); }');
+        // el alfa tambien se mezcla (con los mismos factores; los de color usan el alfa), como el hardware y Dolphin
+        if (st.sub) L.push('Rr = cl(dr - Rr); Gg = cl(dg - Gg); Bb = cl(db - Bb);' + (st.pfmt === 1 ? ' Aa = cl(da - Aa);' : '') + ' }');
         else {
           const sf = st.srcF, df = st.dstF;
           L.push('const r = Rr * ' + fac(sf, 'dr') + ' + dr * ' + fac(df, 'Rr') + ', gg = Gg * ' + fac(sf, 'dg') + ' + dg * ' + fac(df, 'Gg') + ', b = Bb * ' + fac(sf, 'db') + ' + db * ' + fac(df, 'Bb') + ';');
-          L.push('Rr = cl(r); Gg = cl(gg); Bb = cl(b); }');
+          if (st.pfmt === 1) L.push('const aa = Aa * ' + fac(sf, 'da') + ' + da * ' + fac(df, 'Aa') + ';');
+          L.push('Rr = cl(r); Gg = cl(gg); Bb = cl(b);' + (st.pfmt === 1 ? ' Aa = cl(aa);' : '') + ' }');
         }
       }
       L.push('let r8 = (Rr * 255 + 0.5) | 0, g8 = (Gg * 255 + 0.5) | 0, b8 = (Bb * 255 + 0.5) | 0, a8 = (Aa * 255 + 0.5) | 0;');
@@ -16095,7 +16097,7 @@ registerProcessor('ngbsn-out', NgbsnOut);
         const cd = ((ce >> 22) & 3) * 4;
         R[cd] = res[0]; R[cd + 1] = res[1]; R[cd + 2] = res[2]; R[((ae >> 22) & 3) * 4 + 3] = res[3];
       }
-      const oc = st.outC, ra = R[st.outA], Aa = ra < 0 ? 0 : ra > 1 ? 1 : ra;
+      const oc = st.outC, ra = R[st.outA]; let Aa = ra < 0 ? 0 : ra > 1 ? 1 : ra;
       // prueba de alfa
       if (!st.alwaysA) {
         const a8 = Math.round(Aa * 255), r0 = gxCmp(st.comp0, a8, st.ref0), r1 = gxCmp(st.comp1, a8, st.ref1);
@@ -16118,12 +16120,13 @@ registerProcessor('ngbsn-out', NgbsnOut);
       const dst = this.efb[i], fmt = st.pfmt;
       if (st.blend) {
         const dr = (dst & 255) / 255, dg = ((dst >> 8) & 255) / 255, db = ((dst >> 16) & 255) / 255, da = fmt === 1 ? (dst >>> 24) / 255 : 1;
-        if (st.sub) { Rr = gxCl(dr - Rr); Gg = gxCl(dg - Gg); Bb = gxCl(db - Bb); }
+        if (st.sub) { Rr = gxCl(dr - Rr); Gg = gxCl(dg - Gg); Bb = gxCl(db - Bb); if (fmt === 1) Aa = gxCl(da - Aa); }
         else {
           // factor de origen (2/3 = color de destino) y de destino (2/3 = color de origen)
           const sf = st.srcF, df = st.dstF;
           const r = Rr * gxFac(sf, dr, Aa, da) + dr * gxFac(df, Rr, Aa, da), gg = Gg * gxFac(sf, dg, Aa, da) + dg * gxFac(df, Gg, Aa, da), b = Bb * gxFac(sf, db, Aa, da) + db * gxFac(df, Bb, Aa, da);
-          Rr = gxCl(r); Gg = gxCl(gg); Bb = gxCl(b);
+          const aa = fmt === 1 ? Aa * gxFac(sf, da, Aa, da) + da * gxFac(df, Aa, Aa, da) : Aa;   // el alfa tambien se mezcla
+          Rr = gxCl(r); Gg = gxCl(gg); Bb = gxCl(b); Aa = gxCl(aa);
         }
       }
       let r8 = Math.round(Rr * 255), g8 = Math.round(Gg * 255), b8 = Math.round(Bb * 255), a8 = Math.round(Aa * 255);
@@ -16837,12 +16840,12 @@ registerProcessor('ngbsn-out', NgbsnOut);
       const a1 = st.pfmt === 1, logicNoop = !st.blend && st.logic && st.logicOp === 5;
       gl.enable(gl.BLEND); gl.blendColor(0, 0, 0, 1);
       const fA = a1 ? gl.ONE : gl.CONSTANT_ALPHA, fB = gl.ZERO;
-      if (st.blend && st.sub) { gl.blendEquationSeparate(gl.FUNC_REVERSE_SUBTRACT, gl.FUNC_ADD); gl.blendFuncSeparate(gl.ONE, gl.ONE, fA, fB); }
+      if (st.blend && st.sub) { if (a1) { gl.blendEquation(gl.FUNC_REVERSE_SUBTRACT); gl.blendFunc(gl.ONE, gl.ONE); } else { gl.blendEquationSeparate(gl.FUNC_REVERSE_SUBTRACT, gl.FUNC_ADD); gl.blendFuncSeparate(gl.ONE, gl.ONE, fA, fB); } }   // con alfa (RGBA6) el alfa tambien se mezcla
       else if (st.blend) {
         const dA = a1 ? gl.DST_ALPHA : gl.ONE, idA = a1 ? gl.ONE_MINUS_DST_ALPHA : gl.ZERO;
         const src = [gl.ZERO, gl.ONE, gl.DST_COLOR, gl.ONE_MINUS_DST_COLOR, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, dA, idA][st.srcF];
         const dst = [gl.ZERO, gl.ONE, gl.SRC_COLOR, gl.ONE_MINUS_SRC_COLOR, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, dA, idA][st.dstF];
-        gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD); gl.blendFuncSeparate(src, dst, fA, fB);
+        gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD); if (a1) gl.blendFuncSeparate(src, dst, src, dst); else gl.blendFuncSeparate(src, dst, fA, fB);
       } else { gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD); gl.blendFuncSeparate(gl.ONE, gl.ZERO, fA, fB); }
       const cu = !!st.colUpd && !logicNoop;
       gl.colorMask(cu, cu, cu, a1 ? !!st.alphaUpd && !logicNoop : false);   // RGB8/RGB565: el EFB no tiene alfa
@@ -16961,12 +16964,12 @@ registerProcessor('ngbsn-out', NgbsnOut);
       gl.enable(gl.BLEND); gl.blendColor(0, 0, 0, 1);
       const fA = a1 ? gl.ONE : gl.CONSTANT_ALPHA, fB = gl.ZERO;
       const logicDst = !st.blend && st.logic && ![0, 3, 5, 12, 15].includes(st.logicOp);
-      if (st.blend && st.sub) { gl.blendEquationSeparate(gl.FUNC_REVERSE_SUBTRACT, gl.FUNC_ADD); gl.blendFuncSeparate(gl.ONE, gl.ONE, fA, fB); }
+      if (st.blend && st.sub) { if (a1) { gl.blendEquation(gl.FUNC_REVERSE_SUBTRACT); gl.blendFunc(gl.ONE, gl.ONE); } else { gl.blendEquationSeparate(gl.FUNC_REVERSE_SUBTRACT, gl.FUNC_ADD); gl.blendFuncSeparate(gl.ONE, gl.ONE, fA, fB); } }   // con alfa (RGBA6) el alfa tambien se mezcla
       else if (st.blend) {
         const dA = a1 ? gl.DST_ALPHA : gl.ONE, idA = a1 ? gl.ONE_MINUS_DST_ALPHA : gl.ZERO;
         const src = [gl.ZERO, gl.ONE, gl.DST_COLOR, gl.ONE_MINUS_DST_COLOR, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, dA, idA][st.srcF];
         const dst = [gl.ZERO, gl.ONE, gl.SRC_COLOR, gl.ONE_MINUS_SRC_COLOR, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, dA, idA][st.dstF];
-        gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD); gl.blendFuncSeparate(src, dst, fA, fB);
+        gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD); if (a1) gl.blendFuncSeparate(src, dst, src, dst); else gl.blendFuncSeparate(src, dst, fA, fB);
       } else { gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD); gl.blendFuncSeparate(gl.ONE, gl.ZERO, fA, fB); }
       if (logicDst) gl.blendFuncSeparate(gl.ONE, gl.ZERO, fA, fB);
       const cu = !!st.colUpd && !logicNoop;
@@ -36705,6 +36708,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // una version nueva (al acabar la animacion de entrada) y siempre con la insignia de debajo del logo.
   const NGBSN_VERSION = NGBSN_ENGINE_VERSION;
   const NGBSN_CHANGELOG = [
+    { v: '7.36', f: '25-11-2026', t: 'GameCube y Wii: sin rectángulos alrededor de los personajes', i: [
+      'En Ratatouille salía un rectángulo más claro alrededor de las ratas. La GPU emulada mezclaba los colores pero no la transparencia (alfa), y el juego usa ese alfa para saber qué zonas oscurecer.',
+      'Ahora el alfa se mezcla igual que en la consola real, con WebGL y por software. Afecta a todos los juegos de GameCube y Wii que usan alfa en la pantalla.'] },
     { v: '7.35', f: '25-11-2026', t: 'Actualizaciones desde GitHub', i: [
       'El emulador puede actualizarse solo desde GitHub: comprueba en segundo plano si hay una versión nueva, la descarga y la usa la próxima vez que abras el proyecto. No vuelve a descargar lo que ya tienes.',
       'Cada archivo descargado se comprueba (tamaño y SHA-256) antes de usarlo; si llega dañado o incompleto se descarta. Si una versión nueva falla al arrancar, vuelve sola a la última que funcionaba.',
