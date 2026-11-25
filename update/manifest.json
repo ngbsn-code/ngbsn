@@ -1,8 +1,8 @@
 {
   "formato": "ngbsn-update",
   "version_formato": 1,
-  "version": "7.36",
-  "motor": "NGBSN Emulator 7.36",
+  "version": "7.37",
+  "motor": "NGBSN Emulator 7.37",
   "fecha": "2026-11-25",
   "compatibilidad": {
     "apiBloques": 1,
@@ -13,10 +13,10 @@
     {
       "id": "engine",
       "rol": "engine",
-      "ruta": "ngbsn-engine-7.36.js",
-      "tamano": 7695927,
-      "sha256": "5177c5191b4f735e7feec36d41c4ccb49a37bfcb77c00b4a49bc6a9a7e7f37c5"
+      "ruta": "ngbsn-engine-7.37.js",
+      "tamano": 7698791,
+      "sha256": "e522f0604ec62c9414483ad979469f6f122ed117877a6ed215d3e84835f53fd6"
     }
   ],
-  "notas": "GameCube y Wii: el alfa se mezcla como en la consola real (sin rectángulos alrededor de las ratas en Ratatouille)."
+  "notas": "La música de espera suena mientras carga el juego (GameCube, Wii, Switch y DS) y más fuerte."
 }

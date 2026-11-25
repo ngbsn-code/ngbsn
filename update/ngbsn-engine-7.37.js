@@ -17,7 +17,7 @@
 (function (Scratch) {
   // version del motor y de la API de bloques (la que esperan los bloques del proyecto .sb3). El cargador de
   // actualizaciones (updater.js, al final) las mira antes de arrancar el motor
-  const NGBSN_ENGINE_VERSION = '7.36';
+  const NGBSN_ENGINE_VERSION = '7.37';
   const NGBSN_API_BLOQUES = 1;
   const NGBSN_ENGINE = function (Scratch) {
 
@@ -25367,7 +25367,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             words = [1280, 720, 0, 0, 0]; break;
           }
           case 8: { const slot = P.i32(); if (st.slots[slot]) st.slots[slot].state = 'free'; st.avail.signal(); words = [0]; break; }   // CANCEL_BUFFER
-          case 9: { const what = P.i32(); words = [what === 0 ? 1280 : what === 1 ? 720 : what === 2 ? 1 : what === 3 ? 1 : 0, 0]; break; }   // QUERY
+          case 9: { const what = P.i32(); words = [(what === 0 || what === 6) ? 1280 : (what === 1 || what === 7) ? 720 : what === 2 ? 1 : 0, 0]; break; }   // QUERY
           default: words = [0];
         }
         return nxParcelOut(words);
@@ -26279,14 +26279,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             c.pc = fnAddr;
             let guard = 0;
-            while (c.pc !== sentinel && !c.halted && ++guard < 4000) c.run(50000);
+            while (c.pc !== sentinel && !c.halted && ++guard < 100000) c.run(50000);
             return R[0] | 0;
           };
           ctx.pushObject({
             name: 'IJitEnvironment',
             cmds: {
               0: c => { // GenerateCode
-                const funcType = Number(c.u64(8));
+                const paramsSize = Number(c.u64(0)), funcType = Number(c.u64(8));
                 const rxOff = Number(c.u64(16)), rxLen = Number(c.u64(24));
                 const roOff = Number(c.u64(32)), roLen = Number(c.u64(40));
                 const inAddr = (c.A && c.A[0]) ? c.A[0].addr : 0, inSize = (c.A && c.A[0]) ? c.A[0].size : 0;
@@ -26296,12 +26296,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 w64m(ioBase + 0xA0, roOff); w64m(ioBase + 0xA8, 0);
                 w64m(ioBase + 0xB0, rxOff); w64m(ioBase + 0xB8, rxLen);
                 w64m(ioBase + 0xC0, roOff); w64m(ioBase + 0xC8, roLen);
-                for (let k = 0; k < 8; k++) m.w32(ioBase + 0xD0 + k * 4, c.u32(48 + k * 4));
+                const pWords = Math.min(16, Math.ceil(Math.max(0, paramsSize) / 4));
+                for (let k = 0; k < pWords; k++) m.w32(ioBase + 0xD0 + k * 4, c.u32(48 + k * 4));
                 if (symGen) {
                   runPlugin(symGen, [
                     ioBase + 0x80, ioBase + 0x90, ioBase + 0xA0, ioBase,
                     funcType, inAddr, inSize, ioBase + 0xB0,
-                    ioBase + 0xC0, ioBase + 0xD0, 32, outAddr, outSize
+                    ioBase + 0xC0, ioBase + 0xD0, paramsSize, outAddr, outSize
                   ]);
                 }
                 if (sys.cpu && sys.cpu.jit && sys.cpu.jit.blocks) {
@@ -36708,6 +36709,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // una version nueva (al acabar la animacion de entrada) y siempre con la insignia de debajo del logo.
   const NGBSN_VERSION = NGBSN_ENGINE_VERSION;
   const NGBSN_CHANGELOG = [
+    { v: '7.37', f: '25-11-2026', t: 'La música de espera ya se oye', i: [
+      'En GameCube, Wii, Switch y DS la música de ascensor se cortaba en cuanto arrancaba la consola, antes de que diera tiempo a oírla. Ahora sigue sonando mientras el juego carga (pantalla negra) y se apaga sola cuando sale la primera imagen, como mucho al minuto o al volver al menú.',
+      'Suena más fuerte que antes.'] },
     { v: '7.36', f: '25-11-2026', t: 'GameCube y Wii: sin rectángulos alrededor de los personajes', i: [
       'En Ratatouille salía un rectángulo más claro alrededor de las ratas. La GPU emulada mezclaba los colores pero no la transparencia (alfa), y el juego usa ese alfa para saber qué zonas oscurecer.',
       'Ahora el alfa se mezcla igual que en la consola real, con WebGL y por software. Afecta a todos los juegos de GameCube y Wii que usan alfa en la pantalla.'] },
@@ -36825,7 +36829,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       this.ctx = ctx; this.playing = true; this.step = 0;
       this.out = ctx.createGain(); this.out.gain.value = 0;
       this.out.connect(ctx.destination);
-      const v = 0.6 * Math.max(0, Math.min(4, vol === undefined ? 1 : vol));
+      const v = 1.1 * Math.max(0, Math.min(4, vol === undefined ? 1 : vol));   // (con 0,6 casi no se oia)
       this.out.gain.setValueAtTime(0, ctx.currentTime);
       this.out.gain.linearRampToValueAtTime(v, ctx.currentTime + 0.6);   // entra suave: si la carga es instantanea no se oye
       if (!this.noise) {
@@ -37000,8 +37004,44 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       try { const r = await mLoad.call(this, args, util); const g = this.chosen; gcds = !!(g && (g.system === 'GC' || g.system === 'DS') && !this.gcErr); return r; }
       finally { if (!gcds) this._waitStop(); }                // GC y DS: sigue hasta que arranca la consola
     };
-    P.gcStart = async function (args, util) { try { return await gStart.call(this, args, util); } finally { this._waitStop(); } };
-    P.dsStart = function (args, util) { try { return dStart.call(this, args, util); } finally { this._waitStop(); } };
+    // GameCube, Wii, Switch y DS: la consola arranca enseguida pero el juego tarda en salir (pantalla negra mientras lee
+    // el disco). La musica sigue hasta la primera imagen que no sea negra, como mucho 60 s, o hasta volver al menu.
+    P._waitUntilImage = function () { if (this.waitMusic && this.waitMusic.playing) { this._waitImgT0 = nowMs(); this._waitImgN = 0; } else this._waitStop(); };
+    P.gcStart = async function (args, util) {
+      let ok = false;
+      try { const r = await gStart.call(this, args, util); ok = !this.gcErr; return r; } finally { if (ok) this._waitUntilImage(); else this._waitStop(); }
+    };
+    P.dsStart = function (args, util) {
+      let ok = false;
+      try { const r = dStart.call(this, args, util); ok = true; return r; } finally { if (ok) this._waitUntilImage(); else this._waitStop(); }
+    };
+    const show = P._show, mFrame = P.menuFrame;
+    let probe = null;
+    const notBlack = img => {                                  // la imagen reducida a 16 x 12: algun pixel con luz
+      if (!probe) { probe = document.createElement('canvas'); probe.width = 16; probe.height = 12; }
+      const g = probe.getContext('2d', { willReadFrequently: true });
+      if (typeof ImageData !== 'undefined' && img instanceof ImageData) {
+        const d = img.data, sx = img.width / 16, sy = img.height / 12;
+        for (let y = 0; y < 12; y++) for (let x = 0; x < 16; x++) { const o = ((Math.floor((y + 0.5) * sy) * img.width) + Math.floor((x + 0.5) * sx)) * 4; if (d[o] + d[o + 1] + d[o + 2] > 90) return true; }
+        return false;
+      }
+      g.clearRect(0, 0, 16, 12); g.drawImage(img, 0, 0, 16, 12);
+      const d = g.getImageData(0, 0, 16, 12).data;
+      for (let o = 0; o < d.length; o += 4) if (d[o] + d[o + 1] + d[o + 2] > 90) return true;
+      return false;
+    };
+    P._show = function (util, renderer, img, resolution) {
+      if (this._waitImgT0 !== undefined) {
+        let done = !(this.waitMusic && this.waitMusic.playing) || nowMs() - this._waitImgT0 > 60000;
+        if (!done && (this._waitImgN++ % 4) === 0) { try { done = notBlack(img); } catch (e) { done = true; } }
+        if (done) { this._waitImgT0 = undefined; this._waitStop(); }
+      }
+      return show.call(this, util, renderer, img, resolution);
+    };
+    P.menuFrame = function (args, util) {
+      if (this._waitImgT0 !== undefined) { this._waitImgT0 = undefined; this._waitStop(); }   // se volvio al menu
+      return mFrame.call(this, args, util);
+    };
   }
 
   Scratch.extensions.register(new GpuScreen());
