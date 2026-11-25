@@ -1,0 +1,22 @@
+{
+  "formato": "ngbsn-update",
+  "version_formato": 1,
+  "version": "7.35",
+  "motor": "NGBSN Emulator 7.35",
+  "fecha": "2026-11-25",
+  "compatibilidad": {
+    "apiBloques": 1,
+    "sb3Minimo": null
+  },
+  "descargaSb3": null,
+  "archivos": [
+    {
+      "id": "engine",
+      "rol": "engine",
+      "ruta": "ngbsn-engine-7.35.js",
+      "tamano": 7692010,
+      "sha256": "ca8b8c8f9f2e5d0e12e01ca33c73d4bb52c2f4fb901fcbbc004b3a153bd6f0dc"
+    }
+  ],
+  "notas": "GitHub Update System: actualizaciones verificadas desde GitHub."
+}
