@@ -17,7 +17,7 @@
 (function (Scratch) {
   // version del motor y de la API de bloques (la que esperan los bloques del proyecto .sb3). El cargador de
   // actualizaciones (updater.js, al final) las mira antes de arrancar el motor
-  const NGBSN_ENGINE_VERSION = '7.37';
+  const NGBSN_ENGINE_VERSION = '7.38';
   const NGBSN_API_BLOQUES = 1;
   const NGBSN_ENGINE = function (Scratch) {
 
@@ -13407,75 +13407,91 @@ registerProcessor('ngbsn-out', NgbsnOut);
     }
 
     // ---- DSP HLE: interprete de lista de comandos AX y mezclador de voces (ADPCM / PCM16 / PCM8)
+    // AX de GameCube (como Dolphin, AXUCode::HandleCommandList): una lista de palabras de 16 bits. Buferes de 5 ms (160
+    // muestras de 32 bits): principal L/R/S y auxiliares A y B (L/R/S). Las voces (AXPB) van en una lista enlazada.
     _axProcessCmdList (cmdAddr) {
       let p = this._p(cmdAddr);
       if (p < 0) return;
-      const mixL = new Int32Array(160), mixR = new Int32Array(160), mixS = new Int32Array(160);
-      const auxAL = new Int32Array(160), auxAR = new Int32Array(160), auxAS = new Int32Array(160);
-      const auxBL = new Int32Array(160), auxBR = new Int32Array(160), auxBS = new Int32Array(160);
-      const clamp16 = x => x < -32768 ? -32768 : x > 32767 ? 32767 : x;
-
-      for (let steps = 0; steps < 1024 && p + 2 <= this.ram.length; steps++) {
-        const op = this.dv.getUint16(p); p += 2;
+      const dv = this.dv, N = 160;
+      const B = this.axBuf || (this.axBuf = Array.from({ length: 9 }, () => new Int32Array(N)));   // mL mR mS aL aR aS bL bR bS
+      const [mL, mR, mS, aL, aR, aS, bL, bR, bS] = B;
+      const clamp16 = x => x < -32767 ? -32767 : x > 32767 ? 32767 : x;
+      const okRam = (q, n) => q >= 0 && q + n <= this.ram.length;
+      const w32 = (q, bufs) => { for (const b of bufs) for (let i = 0; i < N; i++, q += 4) dv.setInt32(q, b[i]); };
+      const dirty = (q, n) => { if (this.dirty) for (let pg = q >>> 12; pg <= (q + n) >>> 12; pg++) this.dirty[pg] = 1; };
+      const rd = () => { const v = dv.getUint16(p); p += 2; return v; };
+      const addr = () => { const hi = rd(), lo = rd(); return ((hi << 16) | lo) >>> 0; };
+      let pbAddr = 0;
+      for (let steps = 0; steps < 256 && p + 2 <= this.ram.length; steps++) {
+        const op = rd();
         switch (op) {
-          case 0x0000: p += 4; break;                   // CMD_SETUP (direccion de tabla de actualizaciones)
-          case 0x0001:                                  // CMD_ADD_TO_LR
-          case 0x0002:                                  // CMD_SUB_TO_LR
-          case 0x0003: {                                // CMD_ADD_SUB_TO_LR
-            const addr = this.dv.getUint32(p); p += 4;
-            const b = this._p(addr);
-            if (b >= 0 && b + 640 <= this.ram.length) {
-              const sgn = op === 2 ? -1 : 1;
-              for (let i = 0; i < 160; i++) {
-                mixL[i] += sgn * this.dv.getInt16(b + i * 4);
-                mixR[i] += sgn * this.dv.getInt16(b + i * 4 + 2);
-              }
+          case 0x00: {                                  // SETUP: valor inicial y cambio de cada bufer (3 palabras x 9)
+            const q = this._p(addr());
+            for (let k = 0; k < 9; k++) {
+              const b = B[k];
+              if (!okRam(q, 54)) { b.fill(0); continue; }
+              const v = dv.getInt32(q + k * 6), d = dv.getInt16(q + k * 6 + 4);
+              if (!v) b.fill(0); else for (let i = 0; i < N; i++) b[i] = v + i * d;
             }
             break;
           }
-          case 0x0004: {                                // CMD_PB_ADDR: recorrer la lista enlazada de bloques AXPB
-            let curPb = this.dv.getUint32(p); p += 4;
-            for (let v = 0; v < 64 && curPb !== 0; v++) {
-              const pbOff = this._p(curPb);
-              if (pbOff < 0 || pbOff + 0xC0 > this.ram.length) break;
-              this._axProcessVoice(pbOff, mixL, mixR, mixS, auxAL, auxAR, auxAS, auxBL, auxBR, auxBS);
-              curPb = this.dv.getUint32(pbOff);
+          case 0x01: {                                  // DL_AND_VOL_MIX: bajar L/R/S y mezclarlos con tres volumenes
+            const q = this._p(addr()), vols = [rd(), rd(), rd()], dst = [[mL, mR, mS], [aL, aR, aS], [bL, bR, bS]];
+            if (!okRam(q, N * 12)) break;
+            for (let g = 0; g < 3; g++) for (let c = 0; c < 3; c++) for (let i = 0; i < N; i++) dst[g][c][i] += Number((BigInt(dv.getInt32(q + (c * N + i) * 4)) * BigInt(vols[g])) >> 15n);
+            break;
+          }
+          case 0x02: pbAddr = addr(); break;            // PB_ADDR
+          case 0x03: {                                  // PROCESS: todas las voces, milisegundo a milisegundo
+            let cur = pbAddr;
+            for (let v = 0; v < 128 && cur; v++) {
+              const pb = this._p(cur);
+              if (!okRam(pb, 0xF4)) break;
+              this._axProcessVoice(pb, mL, mR, mS, aL, aR, aS, bL, bR, bS);
+              const nx = dv.getUint32(pb) >>> 0; if (nx === cur) break; cur = nx;
             }
             break;
           }
-          case 0x0005: break;                           // CMD_PROCESS (procesado al leer CMD_PB_ADDR)
-          case 0x0006: {                                // CMD_MIX_AUXA
-            p += 8;
-            for (let i = 0; i < 160; i++) { mixL[i] += auxAL[i]; mixR[i] += auxAR[i]; mixS[i] += auxAS[i]; }
+          case 0x04: case 0x05: {                       // MIX_AUXA / MIX_AUXB: subir el auxiliar y sumar lo que devuelve la CPU
+            const wa = this._p(addr()), ra = this._p(addr()), aux = op === 4 ? [aL, aR, aS] : [bL, bR, bS];
+            if (wa > 0 && okRam(wa, N * 12)) { w32(wa, aux); dirty(wa, N * 12); }
+            if (okRam(ra, N * 12)) for (let c = 0; c < 3; c++) { const m = [mL, mR, mS][c]; for (let i = 0; i < N; i++) m[i] += dv.getInt32(ra + (c * N + i) * 4); }
             break;
           }
-          case 0x0007: {                                // CMD_MIX_AUXB
-            p += 8;
-            for (let i = 0; i < 160; i++) { mixL[i] += auxBL[i]; mixR[i] += auxBR[i]; mixS[i] += auxBS[i]; }
+          case 0x06: { const q = this._p(addr()); if (okRam(q, N * 12)) { w32(q, [mL, mR, mS]); dirty(q, N * 12); } break; }   // UPLOAD_LRS
+          case 0x07: case 0x11: {                       // SET_LR / SET_OPPOSITE_LR
+            const q = this._p(addr());
+            if (okRam(q, N * 4)) for (let i = 0; i < N; i++) { const v = dv.getInt32(q + i * 4); mL[i] = v; mR[i] = op === 7 ? v : -v; mS[i] = 0; }
             break;
           }
-          case 0x0008: p += 4; break;                   // CMD_UPLOAD_LRS
-          case 0x0009: break;                           // CMD_SET_OPPOSITE_LR
-          case 0x000A: p += 16; break;                  // CMD_WM_OUTPUT
-          case 0x000B: p += 12; break;                  // CMD_SEND_AUX_AND_MIX
-          case 0x000C: p += 4; break;                   // CMD_SAVE_CONTEXT
-          case 0x000D: p += 16; break;                  // CMD_OUTPUT_WIIMOTE
-          case 0x000E: {                                // CMD_OUTPUT: escribir 160 muestras (5 ms a 32 kHz) en RAM
-            const sAddr = this.dv.getUint32(p), lrAddr = this.dv.getUint32(p + 4); p += 8;
-            const sp = this._p(sAddr), lrp = this._p(lrAddr);
-            if (sp >= 0 && sp + 320 <= this.ram.length) {
-              for (let i = 0; i < 160; i++) this.dv.setInt16(sp + i * 2, clamp16(mixS[i]));
+          case 0x08: p += 20; break;
+          case 0x09: {                                  // MIX_AUXB_NOWRITE
+            const ra = this._p(addr());
+            if (okRam(ra, N * 12)) for (let c = 0; c < 3; c++) { const m = [mL, mR, mS][c]; for (let i = 0; i < N; i++) m[i] += dv.getInt32(ra + (c * N + i) * 4); }
+            break;
+          }
+          case 0x0A: p += 4; break;                     // tabla del compresor
+          case 0x0B: case 0x0C: break;
+          case 0x0D: { const a = addr(); rd(); p = this._p(a); if (p < 0) return; break; }   // MORE: la lista sigue en otro sitio
+          case 0x0E: {                                  // OUTPUT: envolvente (32 bits) y L/R de 16 bits intercalados
+            const sa = this._p(addr()), lr = this._p(addr());
+            if (okRam(sa, N * 4)) { w32(sa, [mS]); dirty(sa, N * 4); }
+            if (okRam(lr, N * 4)) {
+              for (let i = 0; i < N; i++) { dv.setInt16(lr + i * 4, clamp16(mL[i])); dv.setInt16(lr + i * 4 + 2, clamp16(mR[i])); }
+              dirty(lr, N * 4);
             }
-            if (lrp >= 0 && lrp + 640 <= this.ram.length) {
-              for (let i = 0; i < 160; i++) {
-                this.dv.setInt16(lrp + i * 4, clamp16(mixL[i]));
-                this.dv.setInt16(lrp + i * 4 + 2, clamp16(mixR[i]));
-              }
-            }
             break;
           }
-          case 0x000F: return;                          // CMD_END
-          default: return;
+          case 0x0F: return;                            // END
+          case 0x10: {                                  // MIX_AUXB_LR: subir B (L/R), bajar el nuevo B y sumarlo a L/R
+            const ua = this._p(addr()), da = this._p(addr());
+            if (okRam(ua, N * 8)) { w32(ua, [bL, bR]); dirty(ua, N * 8); }
+            if (okRam(da, N * 8)) for (let i = 0; i < N; i++) { const l = dv.getInt32(da + i * 4), r = dv.getInt32(da + (N + i) * 4); bL[i] = l; mL[i] += l; bR[i] = r; mR[i] += r; }
+            break;
+          }
+          case 0x12: p += 8; break;
+          case 0x13: p += 10; break;                    // SEND_AUX_AND_MIX (sin efectos)
+          default: return;                              // una orden que no se conoce: se para
         }
       }
     }
@@ -13510,13 +13526,13 @@ registerProcessor('ngbsn-out', NgbsnOut);
         let vAuxAL = rU16(13), dAuxAL = rS16(14), vAuxAR = rU16(15), dAuxAR = rS16(16);
         let vAuxBL = rU16(17), dAuxBL = rS16(18), vAuxBR = rU16(19), dAuxBR = rS16(20);
         let vS = rU16(23), dS = rS16(24);
-        let veVol = rU16(51), veDelta = rS16(52);
-        const loopFlag = rU16(56), fmt = rU16(57);
-        const loopAddr = rU32(58), endAddr = rU32(60);
-        let curAddr = rU32(62);
-        let predScale = rU16(81), yn1 = rS16(82), yn2 = rS16(83);
-        let ratio = rU32(84); if (ratio === 0) ratio = 0x00010000;
-        let frac = rU16(86);
+        let veVol = rU16(50), veDelta = rS16(51);
+        const loopFlag = rU16(55), fmt = rU16(56);
+        const loopAddr = rU32(57), endAddr = rU32(59);
+        let curAddr = rU32(61);
+        let predScale = rU16(80), yn1 = rS16(81), yn2 = rS16(82);
+        let ratio = rU32(83); if (ratio === 0) ratio = 0x00010000;
+        let frac = rU16(85);
 
         const stepSample = () => {
           if (fmt === 0) {                              // GC ADPCM de 4 bits (direcciones en nibbles de ARAM)
@@ -13526,7 +13542,7 @@ registerProcessor('ngbsn-out', NgbsnOut);
             let nib = (curAddr & 1) ? (b & 0x0F) : (b >>> 4);
             if (nib >= 8) nib -= 16;
             const scale = 1 << (predScale & 0x0F), coefIdx = (predScale >>> 4) & 7;
-            const c1 = rS16(64 + coefIdx * 2), c2 = rS16(64 + coefIdx * 2 + 1);
+            const c1 = rS16(63 + coefIdx * 2), c2 = rS16(63 + coefIdx * 2 + 1);
             const s = Math.max(-32768, Math.min(32767, (((nib * scale) << 11) + c1 * yn1 + c2 * yn2 + 1024) >> 11));
             yn2 = yn1; yn1 = s;
             curAddr = (curAddr + 1) >>> 0;
@@ -13551,8 +13567,8 @@ registerProcessor('ngbsn-out', NgbsnOut);
           if (loopFlag) {
             curAddr = loopAddr;
             if (fmt === 0) {
-              predScale = rU16(91);
-              if (vType === 0) { yn1 = rS16(92); yn2 = rS16(93); }
+              predScale = rU16(90);
+              if (vType === 0) { yn1 = rS16(91); yn2 = rS16(92); }
             }
             return true;
           }
@@ -13594,10 +13610,10 @@ registerProcessor('ngbsn-out', NgbsnOut);
 
         wU16(7, state);
         wU16(9, vL); wU16(11, vR); wU16(13, vAuxAL); wU16(15, vAuxAR); wU16(17, vAuxBL); wU16(19, vAuxBR); wU16(23, vS);
-        wU16(51, veVol);
-        wU32(62, curAddr);
-        wU16(81, predScale); wS16(82, yn1); wS16(83, yn2);
-        wU16(86, frac);
+        wU16(50, veVol);
+        wU32(61, curAddr);
+        wU16(80, predScale); wS16(81, yn1); wS16(82, yn2);
+        wU16(85, frac);
         if (state === 0) break;
       }
     }
@@ -22509,6 +22525,18 @@ registerProcessor('ngbsn-out', NgbsnOut);
           else if (!(d & 0x08000000)) this.instanceId = 0;
           break;
         case 0x5F8: this.indexed = true; break;                             // INDEX_BATCH_COUNT
+        case 0x5F9: case 0x5FC:                                             // DRAW_VERTEX_SMALL / INSTANCED (Vulkan)
+          R[0x35D] = d & 0xFFFF; R[0x35E] = d >>> 16;
+          R[0x586] = (R[0x581] & 0xFFFF) || (R[0x586] & 0xFFFF) || 4;
+          this.prim = R[0x586]; this.indexed = false;
+          this.instanceId = (m === 0x5FC) ? ((this.instanceId || 0) + 1) : 0;
+          this.draw(); break;
+        case 0x5FA: case 0x5FD:                                             // DRAW_INDEX_SMALL / INSTANCED (Vulkan)
+          R[0x5F7] = d & 0xFFFF; R[0x5F8] = d >>> 16;
+          R[0x586] = (R[0x581] & 0xFFFF) || (R[0x586] & 0xFFFF) || 4;
+          this.prim = R[0x586]; this.indexed = true;
+          this.instanceId = (m === 0x5FD) ? ((this.instanceId || 0) + 1) : 0;
+          this.draw(); break;
         case 0x585: this.draw(); break;                                     // VERTEX_END_GL
         case 0x674: this.clear(d); break;                                   // CLEAR_BUFFERS
         default:
@@ -23813,7 +23841,7 @@ registerProcessor('ngbsn-out', NgbsnOut);
           }
           if (a.bgra) { const tmp = AIN[o]; AIN[o] = AIN[o + 2]; AIN[o + 2] = tmp; }
         }
-        const OUT = new Float32Array(128);
+        const OUT = new Float32Array(128); OUT[31] = 1;
         C.AF = AIN; C.AU = AINU; C.OU = new Uint32Array(OUT.buffer); C.CF = vcb.CF; C.CU = vcb.CU; C.kill = 0;
         C.vid = vi; C.iid = g.instanceId || 0; C.r32 = a => g.r32(a); C.w32 = (a, v) => g.w32(a, v);
         vs.fn(C);
@@ -25563,7 +25591,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const cpuAddr = this.gpuToCpu(gva);
         if (cpuAddr && words < 0x200000) {
           this.execPushbuffer(cpuAddr, words);
-          if (this.gpu) this.gpu.flush();                     // la ultima macro del trozo ya tiene todos sus parametros
+          if (!this.pbRem && this.gpu) this.gpu.flush();      // la ultima macro del trozo ya tiene todos sus parametros
         }
       }
     }
@@ -25581,7 +25609,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const cpuAddr = this.gpuToCpu(gva);
         if (cpuAddr && words < 0x200000) {
           this.execPushbuffer(cpuAddr, words);
-          if (this.gpu) this.gpu.flush();
+          if (!this.pbRem && this.gpu) this.gpu.flush();
         }
       }
     }
@@ -25596,27 +25624,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
       return null;
     }
-    // lista de ordenes de la GPU (formato de NVIDIA desde Fermi): por palabra, metodo (bits 0-12, en palabras), subcanal
-    // (13-15), cuenta (16-28) y tipo (29-31): 1 = incrementa, 3 = no incrementa, 4 = dato inmediato (en la cuenta),
-    // 5 = incrementa una vez, 7 = fin de segmento
+    // lista de ordenes de la GPU (formato de NVIDIA desde Fermi): el estado del DMA pusher persiste entre segmentos GPFIFO
+    // (p. ej. Vulkan divide cabecera LOAD_INLINE_DATA 0x6D y los datos del shader en dos entradas GPFIFO consecutivas)
     execPushbuffer (cpuAddr, wordCount) {
       const mem = this.sys.mem;
       let i = 0;
+      while (this.pbRem > 0 && i < wordCount) {
+        const d = mem.r32(cpuAddr + i * 4) >>> 0; i++;
+        const m = this.pbMethod;
+        if (this.pbOp === 1 || this.pbOp === 0) this.pbMethod = (m + 1) & 0x1FFF;
+        else if (this.pbOp === 5) { this.pbMethod = (m + 1) & 0x1FFF; this.pbOp = 3; }
+        this.pbRem--;
+        this.handleMethod(this.pbSub, m, d);
+      }
       while (i < wordCount) {
         const tok = mem.r32(cpuAddr + i * 4) >>> 0; i++;
         const op = tok >>> 29, method = tok & 0x1FFF, sub = (tok >>> 13) & 7, count = (tok >>> 16) & 0x1FFF;
         if (op === 1 || op === 5 || op === 3) {
-          for (let c = 0; c < count && i < wordCount; c++, i++) {
-            const m = op === 1 ? method + c : op === 5 ? (c === 0 ? method : method + 1) : method;
-            this.handleMethod(sub, m, mem.r32(cpuAddr + i * 4) >>> 0);
+          let m = method, curOp = op, rem = count;
+          while (rem > 0 && i < wordCount) {
+            const d = mem.r32(cpuAddr + i * 4) >>> 0; i++; rem--;
+            const useM = m;
+            if (curOp === 1) m = (m + 1) & 0x1FFF;
+            else if (curOp === 5) { m = (m + 1) & 0x1FFF; curOp = 3; }
+            this.handleMethod(sub, useM, d);
           }
+          if (rem > 0) { this.pbRem = rem; this.pbOp = curOp; this.pbSub = sub; this.pbMethod = m; return; }
         } else if (op === 4) {
           this.handleMethod(sub, method, count);
         } else if (op === 7) {
           break;
-        } else if (op === 0 || op === 2) {
-          // formato antiguo (incrementa / no incrementa) con la cuenta en los mismos bits
-          for (let c = 0; c < count && i < wordCount; c++, i++) this.handleMethod(sub, op === 0 ? method + c : method, mem.r32(cpuAddr + i * 4) >>> 0);
         }
       }
     }
@@ -36709,6 +36746,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // una version nueva (al acabar la animacion de entrada) y siempre con la insignia de debajo del logo.
   const NGBSN_VERSION = NGBSN_ENGINE_VERSION;
   const NGBSN_CHANGELOG = [
+    { v: '7.38', f: '25-11-2026', t: 'GameCube: sonido en los juegos con AX (Ratatouille)', i: [
+      'Ratatouille de GameCube no tenía sonido: el procesador de sonido emulado (AX) entendía mal las órdenes del juego y no mezclaba ninguna voz. Ahora usa el formato real (como Dolphin) y se oyen las voces, la música y los efectos.',
+      'La música de espera ya no se apaga al ver la pantalla de "cargando" del emulador ni el contador de FPS: sigue hasta que el juego enseña algo de verdad.'] },
     { v: '7.37', f: '25-11-2026', t: 'La música de espera ya se oye', i: [
       'En GameCube, Wii, Switch y DS la música de ascensor se cortaba en cuanto arrancaba la consola, antes de que diera tiempo a oírla. Ahora sigue sonando mientras el juego carga (pantalla negra) y se apaga sola cuando sale la primera imagen, como mucho al minuto o al volver al menú.',
       'Suena más fuerte que antes.'] },
@@ -37017,23 +37057,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     };
     const show = P._show, mFrame = P.menuFrame;
     let probe = null;
-    const notBlack = img => {                                  // la imagen reducida a 16 x 12: algun pixel con luz
-      if (!probe) { probe = document.createElement('canvas'); probe.width = 16; probe.height = 12; }
-      const g = probe.getContext('2d', { willReadFrequently: true });
+    // la imagen reducida a 32 x 24: tiene algo dibujado (no es negra ni de un color liso, como el verde de la memoria
+    // de video vacia de la GameCube)
+    const notBlack = img => {
+      if (!probe) { probe = document.createElement('canvas'); probe.width = 32; probe.height = 24; }
+      let d;
       if (typeof ImageData !== 'undefined' && img instanceof ImageData) {
-        const d = img.data, sx = img.width / 16, sy = img.height / 12;
-        for (let y = 0; y < 12; y++) for (let x = 0; x < 16; x++) { const o = ((Math.floor((y + 0.5) * sy) * img.width) + Math.floor((x + 0.5) * sx)) * 4; if (d[o] + d[o + 1] + d[o + 2] > 90) return true; }
-        return false;
+        const sx = img.width / 32, sy = img.height / 24; d = new Uint8ClampedArray(32 * 24 * 4);
+        for (let y = 0; y < 24; y++) for (let x = 0; x < 32; x++) { const o = ((Math.floor((y + 0.5) * sy) * img.width) + Math.floor((x + 0.5) * sx)) * 4, k = (y * 32 + x) * 4; d[k] = img.data[o]; d[k + 1] = img.data[o + 1]; d[k + 2] = img.data[o + 2]; }
+      } else {
+        const g = probe.getContext('2d', { willReadFrequently: true });
+        g.clearRect(0, 0, 32, 24); g.drawImage(img, 0, 0, 32, 24); d = g.getImageData(0, 0, 32, 24).data;
       }
-      g.clearRect(0, 0, 16, 12); g.drawImage(img, 0, 0, 16, 12);
-      const d = g.getImageData(0, 0, 16, 12).data;
-      for (let o = 0; o < d.length; o += 4) if (d[o] + d[o + 1] + d[o + 2] > 90) return true;
-      return false;
+      let lo = 1e9, hi = -1, lit = 0;
+      // sin la franja de arriba (alli va el contador de FPS)
+      for (let o = 32 * 2 * 4; o < d.length; o += 4) { const v = d[o] + d[o + 1] + d[o + 2]; if (v < lo) lo = v; if (v > hi) hi = v; if (v > 90) lit++; }
+      return lit >= 3 && hi - lo > 60;
     };
     P._show = function (util, renderer, img, resolution) {
       if (this._waitImgT0 !== undefined) {
         let done = !(this.waitMusic && this.waitMusic.playing) || nowMs() - this._waitImgT0 > 60000;
-        if (!done && (this._waitImgN++ % 4) === 0) { try { done = notBlack(img); } catch (e) { done = true; } }
+        const card = img === this.gcCanvas || img === this.dsCanvas;   // la tarjeta de "cargando" del emulador no cuenta
+        if (!done && !card && (this._waitImgN++ % 4) === 0) { try { done = notBlack(img); } catch (e) { done = true; } }
         if (done) { this._waitImgT0 = undefined; this._waitStop(); }
       }
       return show.call(this, util, renderer, img, resolution);
