@@ -17,7 +17,7 @@
 (function (Scratch) {
   // version del motor y de la API de bloques (la que esperan los bloques del proyecto .sb3). El cargador de
   // actualizaciones (updater.js, al final) las mira antes de arrancar el motor
-  const NGBSN_ENGINE_VERSION = '7.39';
+  const NGBSN_ENGINE_VERSION = '7.40';
   const NGBSN_API_BLOQUES = 1;
   const NGBSN_ENGINE = function (Scratch) {
 
@@ -12132,6 +12132,23 @@ registerProcessor('ngbsn-out', NgbsnOut);
       const ops = [], segs = [];
       const inBlock = t => (t >= segStart && t <= a) || segs.some(([s0, s1]) => t >= s0 && t <= s1);
       const pg = m.physPage ? m.physPage(pc) : -1;
+      // bucle de cache (DCFlushRange / DCStoreRange / DCInvalidateRange: dcbf|dcbst|dcbi|dcbt|dcbtst rA,rB; addi rB,rB,32;
+      // bdnz): aqui la cache no existe y esas instrucciones no hacen nada. Se cuentan todas las vueltas (el tiempo emulado
+      // es el mismo) pero se hacen de una vez: en Ratatouille de Wii era una cuarta parte de todas las instrucciones
+      {
+        const o0 = m.read32(pc) >>> 0, o1 = m.read32((pc + 4) >>> 0) >>> 0, o2 = m.read32((pc + 8) >>> 0) >>> 0;
+        const RB = (o0 >>> 11) & 31, x0 = (o0 >>> 1) & 1023, step = (o1 << 16) >> 16;
+        if (!this.noCacheLoop && (o0 >>> 26) === 31 && [54, 86, 470, 246, 278].includes(x0) && (o0 & 1) === 0 &&
+          (o1 >>> 26) === 14 && ((o1 >>> 21) & 31) === RB && ((o1 >>> 16) & 31) === RB && RB !== 0 && step > 0 &&
+          (o2 >>> 26) === 16 && ((o2 >>> 21) & 31) === 16 && (o2 & 3) === 0 && ((((pc + 8) >>> 0) + ((o2 & 0xFFFC) << 16 >> 16)) >>> 0) === pc) {
+          ops.push(o0, o1, o2);
+          src.push('let k = c.ctr === 0 ? 4294967296 : c.ctr; const room = Math.max(1, Math.floor(lim / 3)); if (k > room) k = room;');
+          src.push('r[' + RB + '] = (r[' + RB + '] + ' + step + ' * k) >>> 0; c.ctr = (c.ctr - k) >>> 0; c.instr += 3 * k;');
+          src.push('c.pc = c.ctr !== 0 ? ' + pc + ' : ' + ((pc + 12) >>> 0) + '; return 3 * k;');
+          n = 3; a = (pc + 12) >>> 0; end = true;
+          this.cacheLoops = (this.cacheLoops || 0) + 1;
+        }
+      }
       while (!end && n < JIT_MAX) {
         const op = m.read32(a);
         const tgt = ((a) + ((op & 0xFFFC) << 16 >> 16)) >>> 0;
@@ -12637,6 +12654,17 @@ registerProcessor('ngbsn-out', NgbsnOut);
       }
     }
 
+    // procesador mas lento (s < 1, como el "underclock" de Dolphin): menos instrucciones por linea de video y la base de
+    // tiempos ajustada para que el tiempo del juego siga al reloj real. Con un ordenador que no llega, la consola va a
+    // su velocidad (60 fotogramas por segundo) y el juego dibuja algo menos de imagenes propias, en vez de ir todo a camara
+    // lenta. Se cambia entre fotogramas (gcworker: velocidad automatica)
+    setCpuScale (s) {
+      s = Math.max(0.5, Math.min(1, +s || 1));
+      const c = this.cpu, base = this.lineInstrBase || this.lineInstr, cpi = this.cpiBase || GC_CPI;
+      const ticks = Math.floor((c.instr - c.tbSync) * c.tbRate); c.tb += ticks; c.tbSync += ticks / c.tbRate;   // la base de tiempos al dia con el ritmo de antes
+      this.cpuScale = s; this.lineInstr = Math.max(1, Math.round(base * s)); c.tbRate = (cpi / 12) / s;
+    }
+
     reset () {
       // base de tiempos con los mismos ciclos por instruccion que el video (GC_CPI): con 2 avanzaba al 40 % del tiempo de
       // la imagen y los juegos que miden el tiempo con OSGetTick (Pikmin) iban a camara lenta
@@ -12648,6 +12676,7 @@ registerProcessor('ngbsn-out', NgbsnOut);
       // instrucciones por linea de video: Gekko a 486 MHz; en la Wii (Broadway, 729 MHz) 1,5 veces mas. La base de
       // tiempos va igual en las dos (procesador / 12)
       this.lineInstr = this.wii ? Math.round(729000000 / 60 / GC_LINES / cpi) : GC_LINE_INSTR;
+      this.lineInstrBase = this.lineInstr; this.cpiBase = cpi; this.cpuScale = 1;
       this.vi = new Uint16Array(0x80);                  // registros de 16 bits del VI (0xCC002000)
       this.viLine = 1; this.frames = 0; this.field = 0;
       this.pi = { intsr: 0, intmr: 0, fifo: new Uint32Array(8) };
@@ -15144,13 +15173,14 @@ registerProcessor('ngbsn-out', NgbsnOut);
           if (p + 5 > end) { this._want = p + 5; break; }
           const v = gxRd32(b, p + 1), idx = v >>> 16, n = ((v >>> 12) & 15) + 1, addr = v & 0xFFF, arr = 12 + ((op >> 3) & 3);
           const base = this.cp[0xA0 + arr], stride = this.cp[0xB0 + arr];
+          if (this.memPatch) this.memPatch((base + idx * stride) & 0x1FFFFFFF, n * 4);   // hilo del procesador: lo que lee, como esta ahora
           for (let i = 0; i < n; i++) this._xf(addr + i, this.m.read32((0x80000000 | (base + idx * stride + i * 4)) >>> 0));
           p += 5; continue;
         }
         if (op === 0x40) {                                                                  // CALL_DL: lista de dibujo en la RAM
           if (p + 9 > end) { this._want = p + 9; break; }
           const a = gxRd32(b, p + 1) & 0x1FFFFFE0, n = gxRd32(b, p + 5) & ~31;   // (29 bits: en la Wii tambien la MEM2)   // el CP ignora los 5 bits bajos (direccion y tamano de 32 en 32)
-          if (a + n <= this.m.ram.length) { this.run(this.m.ram, a, a + n); this._want = 0; }
+          if (a + n <= this.m.ram.length) { if (this.memPatch) this.memPatch(a, n); this.run(this.m.ram, a, a + n); this._want = 0; }
           p += 9; continue;
         }
         if (op === 0x61) { if (p + 5 > end) { this._want = p + 5; break; } this._bp(b[p + 1], gxRd32(b, p + 1) & 0xFFFFFF); p += 5; continue; }
@@ -15161,6 +15191,7 @@ registerProcessor('ngbsn-out', NgbsnOut);
           if (this.gp) this._markGfx(fmt, b, p + 3, n);                    // corruptor del Caos: que memoria leen los graficos
           if (!this.light) this._draw((op >> 3) & 7, vat, fmt, b, p + 3, n);   // ligero (hilo del procesador): el dibujo lo hace el hilo de graficos
           else if (this.prepOut) this._prepDraw((op >> 3) & 7, fmt, b, p + 3, n);   // hilo preparador: solo los vertices
+          else if (this.memPatch) this._patchDraw(fmt, b, p + 3, n);       // hilo del procesador: los arrays de vertices que lee
           p += need; continue;
         }
         p++;                                                                                // orden desconocida: saltar un byte
@@ -16189,6 +16220,27 @@ registerProcessor('ngbsn-out', NgbsnOut);
     // corruptor (Caos, estilo corrupcion, gchw.js): apunta las paginas de 4 KB que lee este dibujo. Vertices (2): cada
     // indice de los atributos indexados en su array; texturas (1): la imagen de cada textura activa. Lo hace tambien el
     // GX ligero del hilo del procesador, que es donde se corrompe la RAM
+    // hilo del procesador (dos hilos): que trozos de los arrays de vertices indexados lee este dibujo. El hilo de graficos
+    // repite el fotograma al final, con la RAM del final: si el juego reescribe un array entre dos dibujos (Ratatouille
+    // reutiliza sus buferes de vertices), le llega aqui una copia de como estaba en este momento (memPatch)
+    _patchDraw (fmt, b, p, n) {
+      const cp = this.cp;
+      for (const at of fmt.attrs) {
+        if (at.mode < 2 || at.arr === undefined) continue;
+        const base = cp[0xA0 + at.arr] & 0x1FFFFFFF, stride = cp[0xB0 + at.arr], skip = at.k === 2 ? (at.mode === 2 ? 0xFF : 0xFFFF) : -1, w = at.i3 === 3 ? 3 : 1;
+        let lo = 1e9, hi = -1;
+        for (let v = 0, o = p + at.off; v < n; v++, o += fmt.size) {
+          for (let k = 0; k < w; k++) {
+            const idx = at.mode === 2 ? b[o + k] : (b[o + k * 2] << 8) | b[o + k * 2 + 1];
+            if (idx === skip) continue;
+            if (idx < lo) lo = idx; if (idx > hi) hi = idx;
+          }
+        }
+        if (hi < 0) continue;
+        this.memPatch((base + lo * stride) & 0x1FFFFFFF, (hi - lo) * stride + Math.max(at.dsize || 4, stride) + 9 * (at.step || 1));
+      }
+    }
+
     _markGfx (fmt, b, p, n) {
       const G = this.gp, cp = this.cp;
       for (const at of fmt.attrs) {
@@ -27270,7 +27322,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     const { GcMachine } = CORE;
     let m = null, gl = null, port = null, sound = true, rate = 48000, running = false, paused = false, next = 0;
     let lastIn = 0, noPause = false, slice = 0, shown = -1, fbW = 0, fbH = 0, inflight = 0, fpsT = 0, fpsF = 0, fps = 0;
-    let cardSaved = 0, cardSeen = 0, cardT = 0, msF = 0, msAll = 0;   // ms por fotograma: solo la consola / todo el trabajo
+    let cardSaved = 0, cardSeen = 0, cardT = 0, msF = 0, msAll = 0;
+    // velocidad automatica: si un fotograma cuesta mas que su tiempo (16,7 ms a 60 Hz), el procesador emulado hace menos
+    // instrucciones por fotograma (m.setCpuScale) para que la consola vaya a su velocidad; si sobra tiempo, vuelve a subir
+    let slowS = 0, fineS = 0, autoCpu = true, cpuScale = 1, perLast = 1000 / 60, perfOn = false, perfGx = 0, perfCopy = 0; const perfAcc = { gx: 0, copy: 0 };
+    function ajustarCpu () {
+      if (!autoCpu || turbo || !m.setCpuScale || m.frames < 240) return;   // no durante el arranque (cargas lentas)
+      const meta = perLast * 0.9, ms = msAll;
+      let s = cpuScale;
+      const graficos = !!gxPort && msB > ms * 0.95;          // con dos hilos, si el que no llega es el de graficos, bajar la CPU no sirve
+      const lento = fps < 1000 / perLast - 2;                 // la consola no llega a su velocidad
+      slowS = lento ? slowS + 1 : 0; fineS = lento ? 0 : fineS + 1;
+      // bajar: 3 segundos seguidos lentos y el procesador es el que no llega (una carga puntual no cuenta)
+      if (slowS >= 3 && ms > meta && s > 0.6 && !graficos) { s = Math.max(0.6, s * Math.max(0.85, meta / ms)); slowS = 0; }
+      // subir: va lento por otra cosa (graficos, espera entre hilos) o lleva 2 segundos bien con tiempo de sobra
+      else if (s < 1 && (graficos || (lento && ms < meta * 0.9) || (fineS >= 2 && ms < meta * 0.95))) { s = Math.min(1, s * 1.05); fineS = 0; }
+      if (Math.abs(s - cpuScale) > 0.005) { cpuScale = s; m.setCpuScale(s); }
+    }   // ms por fotograma: solo la consola / todo el trabajo
     // Hilo de graficos aparte (dos Worker): A = procesador (GX "ligero": estado e interrupciones, sin dibujar) y B = solo
     // graficos. Al acabar cada fotograma A manda a B un paquete: paginas de RAM de 4 KB cambiadas, los eventos del GX en
     // orden (bytes de la FIFO, registros del CP y punteros de la FIFO del PI) y los registros del VI. B los repite con su
@@ -27288,7 +27356,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // con 3 el ritmo lo marca el hilo mas lento. Opcion de arranque gxq para probar
     let GXQ = 3;
     let kAuto = 0, msB = 0, prepPorts = [], prepK = -1, seq = 0, prepOutPort = null, prepIdx = 0, vxWait = new Map(), pkWait = [], hilos = 2, misses = 0;                                                 // paquetes sin acabar en el hilo de graficos (mas = mas retraso de los mandos)
-    let gxPort = null, role = 'todo', gxWait = 0, ev = new Uint32Array(1 << 16), evn = 0, srcHz = 60, srcFps = 0;
+    let gxPort = null, role = 'todo', gxWait = 0, ev = new Uint32Array(1 << 16), evn = 0, srcHz = 60, srcFps = 0, patchB = 0, patchBytes = 0;
+    // repetir los eventos de un paquete (B y los preparadores): 1 = tuberia del GX, 2 = registro del CP, 3 = PI,
+    // 4 = parche de RAM (direccion, largo y bytes)
+    function eventos (E) {
+      for (let i = 0; i < E.length;) {
+        const k = E[i];
+        if (k === 4) { const a = E[i + 1], len = E[i + 2]; m.ram.set(new Uint8Array(E.buffer, E.byteOffset + (i + 3) * 4, len), a); i += 3 + ((len + 3) >>> 2); continue; }
+        if (k === 1) m._gxPipe(E[i + 1], E[i + 2]); else if (k === 2) m.gx.cpWrite16(E[i + 1], E[i + 2]); else m._piWrite(E[i + 1], E[i + 2]);
+        i += 3;
+      }
+    }
     const rec = (k, a, b) => {
       if (evn + 3 > ev.length) { const n = new Uint32Array(ev.length * 2); n.set(ev); ev = n; }
       ev[evn++] = k; ev[evn++] = a >>> 0; ev[evn++] = b >>> 0;
@@ -27297,7 +27375,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     function grabar () {
       m.gx.light = true;
       const oPipe = m._gxPipe.bind(m), oCp = m.gx.cpWrite16.bind(m.gx), oPi = m._piWrite.bind(m);
-      m._gxPipe = (v, n) => { rec(1, v, n); return oPipe(v, n); };
+      // el evento va despues de procesar la palabra: los parches que salgan al procesarla quedan antes en el paquete
+      m._gxPipe = (v, n) => { const res = oPipe(v, n); rec(1, v, n); return res; };
+      // parche: bytes de la RAM que el GX lee ahora y que el juego ha cambiado en este fotograma (k = 4, direccion,
+      // largo y los bytes en palabras). Asi el hilo de graficos ve los vertices y matrices de cada momento, no los del
+      // final del fotograma (Ratatouille reutiliza sus buferes: sin esto salian formas gigantes)
+      m.gx.memPatch = (a, len) => {
+        const ram = m.ram, D = m.dirty;
+        if (len <= 0 || a >= ram.length) return;
+        if (a + len > ram.length) len = ram.length - a;
+        let dirty = false;
+        for (let q = a >>> 12, e = (a + len - 1) >>> 12; q <= e; q++) if (D[q]) { dirty = true; break; }
+        if (!dirty) return;                                  // sin cambios en este fotograma: B ya lo tiene igual
+        const words = (len + 3) >>> 2;
+        if (evn + 3 + words > ev.length) { const nn = new Uint32Array(Math.max(ev.length * 2, evn + 3 + words + 1024)); nn.set(ev.subarray(0, evn)); ev = nn; }
+        ev[evn++] = 4; ev[evn++] = a; ev[evn++] = len;
+        new Uint8Array(ev.buffer, evn * 4, len).set(ram.subarray(a, a + len));
+        evn += words;
+        patchB += len;
+      };
       m.gx.cpWrite16 = (o, v) => { rec(2, o, v); return oCp(o, v); };
       m._piWrite = (o, v) => { if (o >= 0x0C && o <= 0x14) rec(3, o, v); return oPi(o, v); };
     }
@@ -27315,15 +27411,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       const pages = new Uint8Array(P.pages);
       for (let i = 0; i < idx.length; i++) pages.set(m.ram.subarray(idx[i] << 12, (idx[i] + 1) << 12), i * 4096);
       new Uint32Array(P.evs, 0, evn).set(ev.subarray(0, evn));
-      const ne = evn; evn = 0;
+      const ne = evn; evn = 0; const patched = patchB > 0; patchBytes = patchBytes * 0.9 + patchB * 0.1; patchB = 0;
       gxWait++;
       const K = !prepPorts.length || prepK === 0 ? 0 : prepK > 0 ? Math.min(prepK, prepPorts.length) : kAuto;
       seq++;
       for (let k = 0; k < prepPorts.length; k++) {                   // todos reciben todo (para seguir el estado del GX); solo k < K preparan
         const pc = pages.slice(0, idx.length * 4096), ec = new Uint32Array(P.evs, 0, ne).slice();
-        prepPorts[k].postMessage({ t: 'pk', seq, K, qi: idx, pages: pc.buffer, evs: ec.buffer, ne, vi: Array.from(m.vi) }, [pc.buffer, ec.buffer]);
+        prepPorts[k].postMessage({ t: 'pk', seq, K, qi: idx, pages: pc.buffer, evs: ec.buffer, ne, patched, vi: Array.from(m.vi) }, [pc.buffer, ec.buffer]);
       }
-      gxPort.postMessage({ t: 'pk', seq, K, qi: idx, pages: P.pages, evs: P.evs, ne, vi: Array.from(m.vi), frames: m.frames, corr: !!m.corr, fps, msA: msF, waitA: waitMs, allA: msAll, st: STo, sent: performance.timeOrigin + now(), latA: latH, hz: ((m.vi[1] >> 8) & 3) === 1 ? 50 : 60, pc: m.cpu.pc >>> 0,
+      gxPort.postMessage({ t: 'pk', seq, K, qi: idx, pages: P.pages, evs: P.evs, ne, patched, cpu: cpuScale, vi: Array.from(m.vi), frames: m.frames, corr: !!m.corr, fps, msA: msF, waitA: waitMs, allA: msAll, st: STo, sent: performance.timeOrigin + now(), latA: latH, hz: ((m.vi[1] >> 8) & 3) === 1 ? 50 : 60, pc: m.cpu.pc >>> 0,
         rumble: m.pad.map(p => (p ? p.rumble | 0 : 0)) }, [P.pages, P.evs]);
     }
     // B: repetir un paquete y sacar la imagen
@@ -27386,11 +27482,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       m.vi.set(d.vi);
       const make = prepIdx < (d.K | 0);
       m.gx.prepOut = make ? { K: d.K, k: prepIdx, buf: new Float32Array(1 << 18), off: 0, counts: [], draws: 0 } : null;
-      const E = new Uint32Array(d.evs, 0, d.ne);
-      for (let i = 0; i < E.length; i += 3) {
-        const k = E[i];
-        if (k === 1) m._gxPipe(E[i + 1], E[i + 2]); else if (k === 2) m.gx.cpWrite16(E[i + 1], E[i + 2]); else m._piWrite(E[i + 1], E[i + 2]);
-      }
+      eventos(new Uint32Array(d.evs, 0, d.ne));
+      if (d.patched) for (let i = 0; i < d.qi.length; i++) m.ram.set(pg.subarray(i * 4096, (i + 1) * 4096), d.qi[i] << 12);   // la RAM del final
       if (make) { const P = m.gx.prepOut, buf = P.buf.buffer, counts = Uint32Array.from(P.counts); prepOutPort.postMessage({ t: 'vx', seq: d.seq, k: prepIdx, buf, counts }, [buf, counts.buffer]); }
       m.gx.prepOut = null;
     }
@@ -27401,14 +27494,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (d.qi.length && m.gx.markRamPages) m.gx.markRamPages(d.qi);   // invalidar texturas cacheadas en paginas reescritas (Ratatouille / GC)
       if (d.corr && d.frames % 30 === 0) m.gx.texEpoch++;      // corruptor del Caos: las texturas otra vez desde la RAM
       m.vi.set(d.vi);
-      const E = new Uint32Array(d.evs, 0, d.ne);
-      for (let i = 0; i < E.length; i += 3) {
-        const k = E[i];
-        if (k === 1) m._gxPipe(E[i + 1], E[i + 2]); else if (k === 2) m.gx.cpWrite16(E[i + 1], E[i + 2]); else m._piWrite(E[i + 1], E[i + 2]);
-      }
+      eventos(new Uint32Array(d.evs, 0, d.ne));
+      if (d.patched) for (let i = 0; i < d.qi.length; i++) m.ram.set(pg.subarray(i * 4096, (i + 1) * 4096), d.qi[i] << 12);   // la RAM del final
       if (m.gx.glb && m.gx.glb.flush) m.gx.glb.flush();
       if (m.gx.chaos && d.frames !== m.frames) m.gx.chaos.tick(d.frames);   // las rondas del Caos van con los fotogramas de A
-      m.frames = d.frames; srcFps = d.fps; stA = d.st; msCpu = d.msA; waitCpu = d.waitA; allCpu = d.allA; if (doneT) idleB = idleB * 0.9 + (t1 - doneT) * 0.1; latP = latP * 0.9 + (performance.timeOrigin + t1 - d.sent) * 0.1; latHA = d.latA; srcHz = d.hz; m.cpu.pc = d.pc;
+      m.frames = d.frames; srcFps = d.fps; cpuScale = d.cpu || 1; stA = d.st; msCpu = d.msA; waitCpu = d.waitA; allCpu = d.allA; if (doneT) idleB = idleB * 0.9 + (t1 - doneT) * 0.1; latP = latP * 0.9 + (performance.timeOrigin + t1 - d.sent) * 0.1; latHA = d.latA; srcHz = d.hz; m.cpu.pc = d.pc;
       for (let n = 0; n < 4; n++) if (m.pad[n] || d.rumble[n]) (m.pad[n] || (m.pad[n] = {})).rumble = d.rumble[n];
       msF = msF * 0.9 + (now() - t1) * 0.1; msAll = msF;
       const t3 = now(); picture(); msPic = msPic * 0.9 + (now() - t3) * 0.1;
@@ -27490,7 +27580,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       fbW = img.w; fbH = img.h; inflight++;
       const buf = bpp === 2 ? img.yuv.buffer : img.px.buffer;
       post({ t: 'frame', w: img.w, h: img.h, buf, yuv: bpp === 2, frames: m.frames, pc: m.cpu.pc >>> 0, fps: role === 'gx' ? srcFps : fps, hz: role === 'gx' ? srcHz : ((m.vi[1] >> 8) & 3) === 1 ? 50 : 60, gl: !!m.gx.glb, glErr: m.gx.glErr || null,
-        tris: m.gx.stats.tris, msF, msAll, yMs, syncMs: m.gx.glb ? m.gx.glb.syncs.readMs : 0, syncAll: m.gx.glb ? Object.assign({}, m.gx.glb.syncs) : null, rumble: m.pad.map(p => (p ? p.rumble | 0 : 0)), msCpu, waitCpu, msPic, allCpu, idleB, latP, latHA, stA, hilos, misses }, [buf]);
+        tris: m.gx.stats.tris, msF, msAll, yMs, syncMs: m.gx.glb ? m.gx.glb.syncs.readMs : 0, syncAll: m.gx.glb ? Object.assign({}, m.gx.glb.syncs) : null, rumble: m.pad.map(p => (p ? p.rumble | 0 : 0)), msCpu, waitCpu, msPic, allCpu, idleB, latP, latHA, stA, hilos, misses, cpu: cpuScale, perfGx, perfCopy }, [buf]);
     }
 
     function saveCard (force) {
@@ -27507,7 +27597,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // un fotograma de la consola (y su sonido, imagen y tarjeta); false si se ha parado
     function one (t) {
-      const per = 1000 / ((typeof globalThis !== 'undefined' && globalThis.NGBSN_HACK60) ? 60 : ((((m.vi[1] >> 8) & 3) === 1) ? 50 : 60));
+      const per = perLast = 1000 / ((typeof globalThis !== 'undefined' && globalThis.NGBSN_HACK60) ? 60 : ((((m.vi[1] >> 8) & 3) === 1) ? 50 : 60));
       for (let n = 0; n < 4; n++) if (heldF[n] > 0 && --heldF[n] === 0) { held[n] = 0; if (m.pad[n]) m.pad[n].buttons = real[n] | 0; }
       const t1 = now();
       if (m._cheats && m._cheats.on && m._cheats.ops && m._cheats.ops.length) {
@@ -27525,7 +27615,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (m.err) { fail(m.err); return false; }
       next += per;
       if (t - next > 4 * per) next = t;                              // muy atrasado: ir mas lento, no a rafagas
-      if (t - fpsT >= 1000) { fps = (m.frames - fpsF) * 1000 / Math.max(1, t - fpsT); fpsT = t; fpsF = m.frames; elegirHilos(); }
+      if (t - fpsT >= 1000) { fps = (m.frames - fpsF) * 1000 / Math.max(1, t - fpsT); fpsT = t; fpsF = m.frames; elegirHilos(); ajustarCpu(); }
       const t2 = now();
       if (!gxPort) { lastTris = m.gx.stats.tris - trisPrev; trisPrev = m.gx.stats.tris; }
       lowRun = lastTris < TURBO_TRIS ? lowRun + 1 : 0;
@@ -27533,6 +27623,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (gxPort) paquete(); else picture(); saveCard(false);
       ST.busy += now() - t1;
       msF = msF * 0.9 + (t2 - t1) * 0.1; msAll = msAll * 0.9 + (now() - t1) * 0.1;
+      if (perfOn) { perfGx = perfGx * 0.9 + perfAcc.gx * 0.1; perfCopy = perfCopy * 0.9 + perfAcc.copy * 0.1; perfAcc.gx = 0; perfAcc.copy = 0; }
       return true;
     }
 
@@ -27565,7 +27656,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
           try {
             if (d.wide169 !== undefined) globalThis.NGBSN_WIDESCREEN = !!d.wide169;
             if (d.hack60 !== undefined) globalThis.NGBSN_HACK60 = !!d.hack60;
-            m = new GcMachine(); rate = d.rate || 48000; sound = d.sound !== false; noPause = !!d.noPause; slice = d.slice || 0; turboOn = d.turbo !== false; if (d.gxq) GXQ = Math.max(1, Math.min(6, d.gxq | 0)); if (d.zall) m.dsp.zAll = true; if (d.cpiWii) m.cpiWii = d.cpiWii; if (d.axWii) m.axWiiMode = d.axWii; m.pikSpawn = d.pikSpawn !== false;   // Pikmin Emergency Spawn   // noPause / slice: solo para medir
+            m = new GcMachine(); rate = d.rate || 48000; sound = d.sound !== false; noPause = !!d.noPause; slice = d.slice || 0; turboOn = d.turbo !== false; if (d.gxq) GXQ = Math.max(1, Math.min(6, d.gxq | 0)); if (d.zall) m.dsp.zAll = true; if (d.cpiWii) m.cpiWii = d.cpiWii; if (d.axWii) m.axWiiMode = d.axWii; if (d.autoCpu === false) autoCpu = false;
+            if (d.perfGx) {                                              // medir: tiempo dentro del GX (ordenes + WebGL) por fotograma
+              const gx = m.gx, ow = gx.run.bind(gx); let dep = 0;
+              gx.run = (b, p, e) => { if (dep++) { try { return ow(b, p, e); } finally { dep--; } } const t = now(); try { return ow(b, p, e); } finally { dep--; perfAcc.gx += now() - t; } };
+              const oc = gx._efbCopy.bind(gx); gx._efbCopy = v => { const t = now(); try { return oc(v); } finally { perfAcc.copy += now() - t; } };
+              perfOn = true;
+            } m.pikSpawn = d.pikSpawn !== false;   // Pikmin Emergency Spawn   // noPause / slice: solo para medir
             if (d.card) m.card.load(new Uint8Array(d.card));
             cardSaved = cardSeen = m.card.dirty;
             // el mando 1 conectado desde el principio (el juego busca los mandos al arrancar; sin el, luego no lo ve)
@@ -27676,10 +27773,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     };
   }
 
-  // juegos de GameCube que van en un solo Worker: codigo del juego (3 letras) + region + editora. GLL?78 = Ratatouille (THQ)
-  const GC_ONE_WORKER = /^GLL.78$/;
-
   // ¿se puede usar el Worker? (lo de dentro del Worker, FileReaderSync y WebGL2 en OffscreenCanvas, se comprueba alli)
+  // juegos de GameCube que iban en un solo Worker (codigo del juego + region + editora). Antes /^GLL.78$/ (Ratatouille):
+  // resuelto desde 7.40 con los parches de RAM (memPatch). Va aqui, fuera del trozo que se copia al Worker
+  const GC_ONE_WORKER = null;
   const gcWorkerOk = () => typeof Worker !== 'undefined' && typeof Blob !== 'undefined' && typeof URL !== 'undefined' &&
     typeof OffscreenCanvas !== 'undefined' && GCEMU.worker !== false;
 
@@ -27721,14 +27818,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     async start (opts) {
       // En Wii (320 MB de RAM por hilo) usamos un solo Worker (CPU + WebGL2 juntos): ahorra 4x RAM y evita que juegos que
       // reutilizan buffers dinamicos de vertices/matrices dentro del mismo fotograma (como Ratatouille) lean datos sobreescritos.
-      const useSplit = GCEMU.split !== false && opts.split !== false && (!opts.wii || opts.split === true) && typeof MessageChannel !== 'undefined';
+      // Wii tambien en dos hilos desde 7.40 (los parches de RAM resuelven los buferes reutilizados), pero sin preparadores
+      // (cada hilo lleva su copia de la memoria de la Wii)
+      const useSplit = GCEMU.split !== false && opts.split !== false && typeof MessageChannel !== 'undefined';
       if (useSplit) {
         try {
           const r = await this._start(opts, true);
           // juegos de GameCube que tambien reescriben sus buferes de vertices dentro del fotograma (con el hilo de graficos
           // aparte, este lee la RAM de final de fotograma: vertices de otros objetos, formas gigantes amarillas y negras
           // en Ratatouille GLLE78): se vuelve a arrancar en un solo Worker, como en la Wii
-          if (!opts.wii && opts.split !== true && GC_ONE_WORKER.test(this.gameId || '')) {
+          // (desde 7.40 el hilo del procesador manda parches de RAM con lo que lee el GX en cada momento: ya no hace falta;
+          // GC_ONE_WORKER queda vacio por si algun juego lo necesitara)
+          if (!opts.wii && opts.split !== true && GC_ONE_WORKER && GC_ONE_WORKER.test(this.gameId || '')) {
             console.warn('GameCube: ' + this.gameId + ' va en un solo Worker (reutiliza sus buferes de vertices)');
             this._kill(); this.loaded = false; this.split = false;
             return this._start(opts, false);
@@ -27755,7 +27856,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       this.wii = !!opts.wii;
       // hilos preparadores (3.o y 4.o): con 6 nucleos o mas, 2; con 4 o 5, 1; menos, ninguno (opts.prep lo fija)
       const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 2;
-      const nPrep = !split ? 0 : opts.prep !== undefined ? opts.prep : cores >= 6 ? 2 : cores >= 4 ? 1 : 0;
+      const nPrep = !split || opts.wii ? 0 : opts.prep !== undefined ? opts.prep : cores >= 6 ? 2 : cores >= 4 ? 1 : 0;
       const pch = []; for (let k = 0; k < nPrep; k++) pch.push({ ac: new MessageChannel(), cb: new MessageChannel() });
       this.wp = [];
       if (split) {
@@ -27803,7 +27904,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
           this._msg(d);
         };
         const f = opts.file, file = f && f.url && typeof f.slice === 'function' && !(typeof Blob !== 'undefined' && f instanceof Blob) ? { url: f.url, size: f.size } : f;
-        const boot = { t: 'boot', wii: !!opts.wii, cpiWii: +opts.cpiWii || 0, axWii: opts.axWii || '', zall: !!opts.zall, gxq: opts.gxq | 0, pikSpawn: opts.pikSpawn !== false, file, dol: !!opts.dol, gl: !!opts.gl, wide169: !!opts.wide169, hack60: !!opts.hack60, card: opts.card || null, rate: opts.rate, sound: opts.sound, noPause: !!opts.noPause, slice: opts.slice, chaos: opts.chaos ? Object.assign({}, opts.chaos) : null };
+        const boot = { t: 'boot', autoCpu: opts.autoCpu !== false, perfGx: !!opts.perfGx, wii: !!opts.wii, cpiWii: +opts.cpiWii || 0, axWii: opts.axWii || '', zall: !!opts.zall, gxq: opts.gxq | 0, pikSpawn: opts.pikSpawn !== false, file, dol: !!opts.dol, gl: !!opts.gl, wide169: !!opts.wide169, hack60: !!opts.hack60, card: opts.card || null, rate: opts.rate, sound: opts.sound, noPause: !!opts.noPause, slice: opts.slice, chaos: opts.chaos ? Object.assign({}, opts.chaos) : null };
         if (split) {
           const pp = pch.slice(0, this.wp.length).map(c => c.ac.port1);
           boot.gxPort = ch.port1; boot.prepPorts = pp; if (opts.prepK !== undefined) boot.prepK = opts.prepK;
@@ -27817,7 +27918,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       switch (d.t) {
         case 'frame':
           if (this.img) gcPost(this.wg || this.w, { t: 'buf', buf: this.img.buf }, [this.img.buf]);   // la anterior no se llego a ver
-          this.img = d; this.frames = d.frames; this.cpu.pc = d.pc; this.fps = d.fps; this.hz = d.hz || 60; this.gx.glb = d.gl; this.gx.glErr = d.glErr; this.gx.stats.tris = d.tris; this.msF = d.msF; this.msAll = d.msAll; this.msCpu = d.msCpu; this.waitCpu = d.waitCpu; this.msPic = d.msPic; this.allCpu = d.allCpu; this.idleB = d.idleB; this.hilos = d.hilos || (this.wg ? 2 : 1); this.prepMiss = d.misses; this.latP = d.latP; this.latHA = d.latHA; this.stA = d.stA; this.yMs = d.yMs; this.syncMs = d.syncMs;
+          this.img = d; this.frames = d.frames; this.cpu.pc = d.pc; this.fps = d.fps; this.hz = d.hz || 60; this.gx.glb = d.gl; this.gx.glErr = d.glErr; this.gx.stats.tris = d.tris; this.msF = d.msF; this.msAll = d.msAll; this.msCpu = d.msCpu; this.waitCpu = d.waitCpu; this.msPic = d.msPic; this.allCpu = d.allCpu; this.idleB = d.idleB; this.hilos = d.hilos || (this.wg ? 2 : 1); this.prepMiss = d.misses; this.latP = d.latP; this.latHA = d.latHA; this.stA = d.stA; this.yMs = d.yMs; this.syncMs = d.syncMs; this.cpuScale = d.cpu || 1; this.perfGx = d.perfGx; this.perfCopy = d.perfCopy;
           for (let n = 0; n < 4; n++) if (this.pad[n]) this.pad[n].rumble = d.rumble[n];
           if (d.syncAll) this.syncAll = d.syncAll;     // lecturas de la GPU por tipo (para medir)
           break;
@@ -34964,7 +35065,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             const card = await SAVE_BRIDGE.getBytes(GC_CARD_KEY, p.wii ? 'Wii' : 'GameCube');   // NGBSN Memory System
             const r = new GcRemote(this);
             await r.start({ file: p.src || p.file, dol: p.dol, wii: !!p.wii, gl: GCEMU.useGL !== false, wide169: !!(this.launcher && this.launcher.opts && this.launcher.opts.widescreen), hack60: !!(this.launcher && this.launcher.opts && this.launcher.opts.hack60), card, rate: this.audio.rate(), chaos: this.launcher && this.launcher.opts.chaos,
-              sound: !(util && util.target) || +this._var(util.target, 'sound_on') !== 0, noPause: !!this.gcNoPause, slice: this.gcSlice, split: this.gcSplit, prep: this.gcPrep, prepK: this.gcPrepK, zall: this.gcZall, gxq: this.gcGxq, cpiWii: this.gcCpiWii, axWii: this.gcAxWii, pikSpawn: !this.launcher || this.launcher.opts.pikspawn !== false,
+              sound: !(util && util.target) || +this._var(util.target, 'sound_on') !== 0, noPause: !!this.gcNoPause, slice: this.gcSlice, split: this.gcSplit, prep: this.gcPrep, prepK: this.gcPrepK, zall: this.gcZall, gxq: this.gcGxq, cpiWii: this.gcCpiWii, autoCpu: this.gcAutoCpu, perfGx: this.gcPerfGx, axWii: this.gcAxWii, pikSpawn: !this.launcher || this.launcher.opts.pikspawn !== false,
               glMain: typeof WebGL2RenderingContext !== 'undefined' });   // gcNoPause: pruebas
             GCEMU.m = r; this.gcM = r; this.gcUseGL = r.gx.glb; this.gcCardSaved = 0;
             return;
@@ -35409,7 +35510,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             const dt = this._pmDt || 0, pfps = dt ? 1 / dt : 0;
             const cfps = m.remote ? (m.fps || 0) : (this.gcFps || 0), meta = m.remote ? (m.hz || 60) : ((m.vi && ((m.vi[1] >> 8) & 3) === 1) ? 50 : 60);   // 50 Hz (PAL) o 60
             // pequeño, arriba a la izquierda: fps de la consola / los que tocan, fps de PenguinMod y su delta time
-            const g = this.gcCtx, txt = cfps.toFixed(0) + '/' + meta + ' fps · PM ' + pfps.toFixed(0) + ' · Δt ' + (dt * 1000).toFixed(1) + ' ms' + (m.remote && m.hilos ? ' · ' + m.hilos + ' hilos' : '');
+            const g = this.gcCtx, txt = cfps.toFixed(0) + '/' + meta + ' fps · PM ' + pfps.toFixed(0) + ' · Δt ' + (dt * 1000).toFixed(1) + ' ms' + (m.remote && m.hilos ? ' · ' + m.hilos + ' hilos' : '') + (m.remote && m.cpuScale && m.cpuScale < 0.995 ? ' · CPU ' + Math.round(m.cpuScale * 100) + ' %' : '');
             g.save(); g.font = 'bold 13px system-ui, sans-serif'; g.textBaseline = 'top';
             const w = g.measureText(txt).width + 8;
             g.fillStyle = 'rgba(0,0,0,0.55)'; g.fillRect(2, 2, w, 17);
@@ -36762,6 +36863,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // una version nueva (al acabar la animacion de entrada) y siempre con la insignia de debajo del logo.
   const NGBSN_VERSION = NGBSN_ENGINE_VERSION;
   const NGBSN_CHANGELOG = [
+    { v: '7.40', f: '26-11-2026', t: 'Ratatouille (GameCube y Wii) mucho más rápido', i: [
+      'GameCube y Wii vuelven a usar dos hilos (procesador y gráficos a la vez) también en Ratatouille. Antes iba en uno solo porque salían formas gigantes amarillas: el hilo de gráficos leía los vértices como estaban al final del fotograma. Ahora el hilo del procesador le manda una copia de lo que el juego tenía en cada momento. Ratatouille de GameCube pasa de unos 40 a unos 60 fps.',
+      'Velocidad automática: si el ordenador no llega, el procesador emulado hace algo menos de trabajo por fotograma (como el «underclock» de Dolphin), para que el juego vaya a su velocidad en vez de a cámara lenta. El contador de FPS muestra «CPU 72 %» cuando está activa; si sobra tiempo, vuelve sola al 100 %.',
+      'Los bucles que vacían la caché del procesador (muy usados en Wii) se resuelven de una vez.'] },
     { v: '7.39', f: '26-11-2026', t: 'GameCube/Wii: todas las instrucciones del procesador; actualizaciones con respaldo', i: [
       'El procesador de GameCube y Wii (Gekko) ya entiende sus 237 instrucciones. Faltaban 9: las de acceso atómico (lwarx / stwcx.), las de cadenas con longitud variable (lswx / stswx), dos de acceso externo y tres de la TLB. Antes, si un juego usaba alguna, se paraba con una excepción.',
       'Actualizaciones: si GitHub no responde o un archivo llega mal, el emulador prueba con un segundo servidor (jsDelivr) antes de rendirse. Sigue comprobando tamaño y SHA-256 de todo lo que baja.',

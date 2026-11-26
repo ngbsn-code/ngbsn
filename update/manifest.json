@@ -1,8 +1,8 @@
 {
   "formato": "ngbsn-update",
   "version_formato": 1,
-  "version": "7.39",
-  "motor": "NGBSN Emulator 7.39",
+  "version": "7.40",
+  "motor": "NGBSN Emulator 7.40",
   "fecha": "2026-11-26",
   "compatibilidad": {
     "apiBloques": 1,
@@ -13,10 +13,10 @@
     {
       "id": "engine",
       "rol": "engine",
-      "ruta": "ngbsn-engine-7.39.js",
-      "tamano": 7707991,
-      "sha256": "a91ae036b95118fea89e146d879d148cce3b0d2c752fa11d011ecf6f939fd0d7"
+      "ruta": "ngbsn-engine-7.40.js",
+      "tamano": 7719051,
+      "sha256": "7b375b9bfe15724ce57b8739497fa74aa4fe111b42744e59fe156d3e1bbee08b"
     }
   ],
-  "notas": "GameCube/Wii: las 237 instrucciones del procesador. Actualizaciones con servidor de respaldo (jsDelivr) y notas de la versión pendiente."
+  "notas": "Ratatouille (GameCube y Wii) mucho más rápido: dos hilos con parches de memoria, velocidad automática de la CPU y bucles de caché de una vez."
 }
