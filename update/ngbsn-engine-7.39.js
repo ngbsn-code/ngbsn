@@ -17,7 +17,7 @@
 (function (Scratch) {
   // version del motor y de la API de bloques (la que esperan los bloques del proyecto .sb3). El cargador de
   // actualizaciones (updater.js, al final) las mira antes de arrancar el motor
-  const NGBSN_ENGINE_VERSION = '7.38';
+  const NGBSN_ENGINE_VERSION = '7.39';
   const NGBSN_API_BLOQUES = 1;
   const NGBSN_ENGINE = function (Scratch) {
 
@@ -11922,6 +11922,21 @@ registerProcessor('ngbsn-out', NgbsnOut);
           while (nb-- > 0) { if (!sh) reg = (reg + 1) & 31; bus.write8(a, (r[reg] >>> (24 - sh)) & 255); a = (a + 1) >>> 0; sh = (sh + 8) & 31; }
           return;
         }
+        case 533: case 661: {                                                           // lswx / stswx: XER[25-31] bytes desde rA|0 + rB
+          let a = xa(), nb = this.xer & 0x7F, reg = (D - 1) & 31, sh = 0;
+          if (xo === 533) { while (nb-- > 0) { if (!sh) { reg = (reg + 1) & 31; r[reg] = 0; } r[reg] = (r[reg] | (bus.read8(a) << (24 - sh))) >>> 0; a = (a + 1) >>> 0; sh = (sh + 8) & 31; } }
+          else { while (nb-- > 0) { if (!sh) reg = (reg + 1) & 31; bus.write8(a, (r[reg] >>> (24 - sh)) & 255); a = (a + 1) >>> 0; sh = (sh + 8) & 31; } }
+          return;
+        }
+        case 20: { const a = xa(); r[D] = bus.read32(a); this.resv = a; this.resvOn = true; return; }   // lwarx: carga y reserva
+        case 150: {                                                                     // stwcx.: guarda si la reserva sigue (un solo procesador: si no se ha gastado)
+          const a = xa(), ok = this.resvOn && this.resv === a;
+          if (ok) bus.write32(a, r[D]);
+          this.resvOn = false; this._setCrf(0, (ok ? 2 : 0) | (this.xer >>> 31)); return;
+        }
+        case 310: r[D] = bus.read32(xa()); return;                                      // eciwx (acceso externo: como una carga)
+        case 438: bus.write32(xa(), r[D]); return;                                      // ecowx
+        case 306: case 370: case 566: return;                                           // tlbie, tlbia, tlbsync (sin TLB que vaciar)
         case 535: { const v = this._loadF32(xa()); this.ps0[D] = v; this.ps1[D] = v; return; }   // lfsx
         case 567: { const a = xu(), v = this._loadF32(a); this.ps0[D] = v; this.ps1[D] = v; r[A] = a; return; }   // lfsux
         case 599: this._loadF64(D, xa()); return;                                       // lfdx
@@ -23587,7 +23602,7 @@ registerProcessor('ngbsn-out', NgbsnOut);
       const bh = 1 << ((w[3] >>> 3) & 7), pitch = (w[3] & 0xFFFF) << 5;
       const bpp = (fmt === 0x24 || fmt === 0x27) ? 8 : (fmt === 0x25 || fmt === 0x26 || fmt === 0x28 || fmt === 0x40) ? 16
         : fmt === 0x08 || fmt === 0x0D ? 4
-        : fmt === 0x15 || fmt === 0x12 || fmt === 0x13 || fmt === 0x0F || fmt === 0x18 ? 2
+        : fmt === 0x15 || fmt === 0x12 || fmt === 0x13 || fmt === 0x14 || fmt === 0x0F || fmt === 0x18 ? 2
         : fmt === 0x1D ? 1 : 4;
       const bc = fmt === 0x24 || fmt === 0x25 || fmt === 0x26 || fmt === 0x27 || fmt === 0x28 || fmt === 0x40;
       const sw = [(w[0] >>> 19) & 7, (w[0] >>> 22) & 7, (w[0] >>> 25) & 7, (w[0] >>> 28) & 7];
@@ -23672,7 +23687,8 @@ registerProcessor('ngbsn-out', NgbsnOut);
         else if (t.bpp === 1) { r = gg = b = al = u8[a]; }
         else if (t.fmt === 0x18) { r = u8[a]; gg = u8[a + 1]; b = 0; al = 255; } // RG8
         else if (t.fmt === 0x12) { const v = u8[a] | (u8[a + 1] << 8); r = (v & 15) * 17; gg = ((v >>> 4) & 15) * 17; b = ((v >>> 8) & 15) * 17; al = ((v >>> 12) & 15) * 17; } // RGBA4
-        else if (t.fmt === 0x13) { const v = u8[a] | (u8[a + 1] << 8); r = ((v >>> 10) & 31) * 255 / 31; gg = ((v >>> 5) & 31) * 255 / 31; b = (v & 31) * 255 / 31; al = (v & 0x8000) ? 255 : 0; } // RGB5A1
+        else if (t.fmt === 0x13) { const v = u8[a] | (u8[a + 1] << 8); r = (v & 1) ? 255 : 0; gg = ((v >>> 1) & 31) * 255 / 31; b = ((v >>> 6) & 31) * 255 / 31; al = ((v >>> 11) & 31) * 255 / 31; } // A5B5G5R1 (con swizzle ABGR = RGBA5551 de N64)
+        else if (t.fmt === 0x14) { const v = u8[a] | (u8[a + 1] << 8); r = (v & 31) * 255 / 31; gg = ((v >>> 5) & 31) * 255 / 31; b = ((v >>> 10) & 31) * 255 / 31; al = (v & 0x8000) ? 255 : 0; } // A1B5G5R5
         else { const v = u8[a] | (u8[a + 1] << 8); r = ((v >>> 11) & 31) * 255 / 31; gg = ((v >>> 5) & 63) * 255 / 63; b = (v & 31) * 255 / 31; al = 255; } // R5G6B5
       }
       if (t.ident) { out[0] = r * 0.00392156862745098; out[1] = gg * 0.00392156862745098; out[2] = b * 0.00392156862745098; out[3] = al * 0.00392156862745098; return; }
@@ -36746,6 +36762,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // una version nueva (al acabar la animacion de entrada) y siempre con la insignia de debajo del logo.
   const NGBSN_VERSION = NGBSN_ENGINE_VERSION;
   const NGBSN_CHANGELOG = [
+    { v: '7.39', f: '26-11-2026', t: 'GameCube/Wii: todas las instrucciones del procesador; actualizaciones con respaldo', i: [
+      'El procesador de GameCube y Wii (Gekko) ya entiende sus 237 instrucciones. Faltaban 9: las de acceso atómico (lwarx / stwcx.), las de cadenas con longitud variable (lswx / stswx), dos de acceso externo y tres de la TLB. Antes, si un juego usaba alguna, se paraba con una excepción.',
+      'Actualizaciones: si GitHub no responde o un archivo llega mal, el emulador prueba con un segundo servidor (jsDelivr) antes de rendirse. Sigue comprobando tamaño y SHA-256 de todo lo que baja.',
+      'En «Novedades» se ven las notas de la actualización ya descargada que se usará la próxima vez.'] },
     { v: '7.38', f: '25-11-2026', t: 'GameCube: sonido en los juegos con AX (Ratatouille)', i: [
       'Ratatouille de GameCube no tenía sonido: el procesador de sonido emulado (AX) entendía mal las órdenes del juego y no mezclaba ninguna voz. Ahora usa el formato real (como Dolphin) y se oyen las voces, la música y los efectos.',
       'La música de espera ya no se apaga al ver la pantalla de "cargando" del emulador ni el contador de FPS: sigue hasta que el juego enseña algo de verdad.'] },
@@ -36818,7 +36838,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       const show = async () => {
         const i = await U.info();
         txt.textContent = '🔄 Motor en uso: v' + i.version + (i.activa === 'descargada' ? ' (actualización descargada; proyecto v' + i.sb3 + ')' : ' (la del proyecto)') +
-          (i.pendiente ? ' · pendiente: v' + i.pendiente : '') + (i.mensaje ? ' · ' + i.mensaje : '') + (i.fuentes.length || i.mensaje ? '' : ' · sin repositorio de actualizaciones configurado');
+          (i.pendiente ? ' · pendiente: v' + i.pendiente : '') + (i.mensaje ? ' · ' + i.mensaje : '') + (i.fuentes.length || i.mensaje ? '' : ' · sin repositorio de actualizaciones configurado') +
+          (i.pendiente && i.notasPendiente ? '\n📦 Novedades de la v' + i.pendiente + ' (se usará al volver a abrir el proyecto): ' + i.notasPendiente : '');
+        txt.style.whiteSpace = 'pre-line';
       };
       const b = document.createElement('button');
       b.textContent = 'Buscar actualizaciones';
@@ -37115,7 +37137,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   const BOOT_TIMEOUT = 1500, FETCH_TIMEOUT = 15000, FILE_TIMEOUT = 180000, CHECK_EVERY = 6 * 3600 * 1000, MAX_FILE = 64 * 1024 * 1024;
   // de donde leer el manifiesto (en orden; el siguiente si el anterior falla). Vacio hasta que se configure el repositorio.
   // Para pruebas: localStorage 'ngbsn_update_manifest' con una URL.
-  const DEFAULT_SOURCES = ['https://raw.githubusercontent.com/ngbsn-code/ngbsn/main/update/manifest.json'];
+  // la segunda es un espejo (jsDelivr) por si raw.githubusercontent.com esta caido o bloqueado; solo se usa si la primera
+  // falla (puede ir con unas horas de retraso)
+  const DEFAULT_SOURCES = ['https://raw.githubusercontent.com/ngbsn-code/ngbsn/main/update/manifest.json',
+    'https://cdn.jsdelivr.net/gh/ngbsn-code/ngbsn@main/update/manifest.json'];
 
   const cmpVer = (a, b) => {
     const pa = String(a).split('.').map(n => parseInt(n, 10) || 0), pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
@@ -37270,7 +37295,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   // ---------------- comprobar y descargar ----------------
-  const sources = () => { try { const o = localStorage.getItem('ngbsn_update_manifest'); if (o) return [o]; } catch (e) { /* nada */ } return DEFAULT_SOURCES.slice(); };
+  const sources = () => { try { const o = localStorage.getItem('ngbsn_update_manifest'); if (o) return o.split('|').filter(Boolean); } catch (e) { /* nada */ } return DEFAULT_SOURCES.slice(); };
   async function fetchT (url, ms, as) {
     const ac = typeof AbortController !== 'undefined' ? new AbortController() : null, t = setTimeout(() => ac && ac.abort(), ms);
     try {
@@ -37315,6 +37340,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       for (const u of urls) {
         try { m = validManifest(await fetchT(u, FETCH_TIMEOUT, 'json')); base = u.replace(/[^/]*$/, ''); break; } catch (e) { lastErr = e; }
       }
+      // los archivos: primero de donde salio el manifiesto y, si la red falla o llegan mal, de las otras fuentes
+      const bases = m ? [base].concat(urls.map(u => u.replace(/[^/]*$/, '')).filter(b => b !== base)) : [];
       if (!m) return finish(st, lastErr && lastErr.net ? { estado: 'sin-conexion', mensaje: 'No se pudo comprobar si hay actualizaciones (' + lastErr.message + ').' }
         : { estado: 'error', mensaje: 'No se pudo leer el manifiesto de actualizaciones (' + (lastErr && lastErr.message) + ').' });
       R.manifest = m;
@@ -37327,10 +37354,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       // descargar a la zona temporal y verificar cada archivo antes de guardarlo
       const files = [];
       for (const f of m.archivos) {
-        const bytes = await fetchT(base + f.ruta, FILE_TIMEOUT, 'bytes');
-        if (bytes.length !== f.tamano) throw Object.assign(new Error('el archivo ' + f.id + ' llegó incompleto o con otro tamaño (' + bytes.length + ' de ' + f.tamano + ' bytes)'), { rechazo: true });
-        const sha = await sha256Hex(bytes);
-        if (sha !== f.sha256) throw Object.assign(new Error('el SHA-256 de ' + f.id + ' no coincide con el publicado'), { rechazo: true });
+        let bytes = null, fail = null;
+        for (const b of bases) {
+          try {
+            const got = await fetchT(b + f.ruta, FILE_TIMEOUT, 'bytes');
+            if (got.length !== f.tamano) throw Object.assign(new Error('el archivo ' + f.id + ' llegó incompleto o con otro tamaño (' + got.length + ' de ' + f.tamano + ' bytes)'), { rechazo: true });
+            if (await sha256Hex(got) !== f.sha256) throw Object.assign(new Error('el SHA-256 de ' + f.id + ' no coincide con el publicado'), { rechazo: true });
+            bytes = got; break;
+          } catch (e) { if (!fail || !fail.rechazo) fail = e; }   // se recuerda un rechazo antes que un fallo de red
+        }
+        if (!bytes) throw fail || new Error('no se pudo descargar ' + f.id);
         await put('staging', m.version + ':' + f.id, { bytes, at: now() });
         files.push({ id: f.id, size: f.tamano, sha256: f.sha256, role: f.rol || 'recurso' });
       }
@@ -37367,6 +37400,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let st = null; try { st = await readState(); } catch (e) { /* nada */ }
     return { activa: R.active, version: R.activeVersion, sb3: R.embedded, apiBloques: R.api, estado: R.status, mensaje: R.message, fuentes: sources(),
       instalada: st && st.installed && st.installed.version, anterior: st && st.previous && st.previous.version, pendiente: st && st.pending && st.pending.version,
+      notasPendiente: st && st.pending ? st.pending.notas || '' : '', notasInstalada: st && st.installed ? st.installed.notas || '' : '',
       malas: st ? Object.keys(st.bad || {}) : [], ultimaComprobacion: st && st.lastCheck, registro: st ? (st.log || []).slice(-10) : [] };
   }
   // volver a la version del proyecto (por si el usuario lo pide): no borra nada, solo deja de usar las descargadas

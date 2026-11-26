@@ -1,9 +1,9 @@
 {
   "formato": "ngbsn-update",
   "version_formato": 1,
-  "version": "7.38",
-  "motor": "NGBSN Emulator 7.38",
-  "fecha": "2026-11-25",
+  "version": "7.39",
+  "motor": "NGBSN Emulator 7.39",
+  "fecha": "2026-11-26",
   "compatibilidad": {
     "apiBloques": 1,
     "sb3Minimo": null
@@ -13,10 +13,10 @@
     {
       "id": "engine",
       "rol": "engine",
-      "ruta": "ngbsn-engine-7.38.js",
-      "tamano": 7704222,
-      "sha256": "da2eccc9eec1b824361292b44efac21d5a66e40136daef31b347a19ab7327b28"
+      "ruta": "ngbsn-engine-7.39.js",
+      "tamano": 7707991,
+      "sha256": "a91ae036b95118fea89e146d879d148cce3b0d2c752fa11d011ecf6f939fd0d7"
     }
   ],
-  "notas": "GameCube: sonido en los juegos con AX (Ratatouille). Música de espera hasta la primera imagen real."
+  "notas": "GameCube/Wii: las 237 instrucciones del procesador. Actualizaciones con servidor de respaldo (jsDelivr) y notas de la versión pendiente."
 }
