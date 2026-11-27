@@ -1,9 +1,9 @@
 {
   "formato": "ngbsn-update",
   "version_formato": 1,
-  "version": "7.40",
-  "motor": "NGBSN Emulator 7.40",
-  "fecha": "2026-11-26",
+  "version": "7.42",
+  "motor": "NGBSN Emulator 7.42",
+  "fecha": "2026-11-27",
   "compatibilidad": {
     "apiBloques": 1,
     "sb3Minimo": null
@@ -13,10 +13,10 @@
     {
       "id": "engine",
       "rol": "engine",
-      "ruta": "ngbsn-engine-7.40.js",
-      "tamano": 7719051,
-      "sha256": "7b375b9bfe15724ce57b8739497fa74aa4fe111b42744e59fe156d3e1bbee08b"
+      "ruta": "ngbsn-engine-7.42.js",
+      "tamano": 7749536,
+      "sha256": "fdfe78bdf9546d1c7b70940ff3bca0f66a7454f8d2c5573b64f1c073585b8303"
     }
   ],
-  "notas": "Ratatouille (GameCube y Wii) mucho más rápido: dos hilos con parches de memoria, velocidad automática de la CPU y bucles de caché de una vez."
+  "notas": "Switch: GPU más rápida (macros compiladas, copias directas; trabajo de Gemini). Traductor A64 más ligero y recuperación al perder WebGL."
 }

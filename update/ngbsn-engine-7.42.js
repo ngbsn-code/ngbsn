@@ -17,7 +17,7 @@
 (function (Scratch) {
   // version del motor y de la API de bloques (la que esperan los bloques del proyecto .sb3). El cargador de
   // actualizaciones (updater.js, al final) las mira antes de arrancar el motor
-  const NGBSN_ENGINE_VERSION = '7.40';
+  const NGBSN_ENGINE_VERSION = '7.42';
   const NGBSN_API_BLOQUES = 1;
   const NGBSN_ENGINE = function (Scratch) {
 
@@ -18745,6 +18745,11 @@ registerProcessor('ngbsn-out', NgbsnOut);
         this.gen = -1;
         this.compiled = 0;
         this.compileBudget = 1e9;
+        // medido con Super Mario 3D All-Stars cargando (miles de bloques nuevos): traducir cuesta ~0,25 ms por bloque, asi
+        // que solo se traducen los que se repiten 50 veces, en bloques de hasta 48 instrucciones y sin seguir saltos
+        // (con 10 / 160 / 6 iba a 16 M instrucciones por segundo; asi, a 19-27)
+        this.hotMin = 50;                                 // ejecuciones por el interprete antes de traducir un bloque
+        this.maxBlock = 48; this.maxHops = 0;
       }
       flush () {
         this.blocks.clear();
@@ -18765,8 +18770,8 @@ registerProcessor('ngbsn-out', NgbsnOut);
             fn = this.blocks.get(pc);
             if (fn === undefined) {
               // Compilar bloques calientes tras 10 ejecuciones (y repartir rafagas de compilacion entre fotogramas para evitar tirones)
-              if (H[idx] < 10 || this.compileBudget <= 0) {
-                if (H[idx] < 10) H[idx]++;
+              if (H[idx] < this.hotMin || this.compileBudget <= 0) {
+                if (H[idx] < this.hotMin) H[idx]++;
                 const op = m.r32(pc); c.pc = pc + 4; c.ticks++; c.exec(op, pc); k++;
                 continue;
               }
@@ -19204,7 +19209,7 @@ registerProcessor('ngbsn-out', NgbsnOut);
           this.compiled++;
           return fn;
         }
-        while (!end && n < A64_JIT_MAX && a >= cBase && a <= cEnd) {
+        while (!end && n < (this.maxBlock || A64_JIT_MAX) && a >= cBase && a <= cEnd) {
           const op = cDv.getUint32(a - cBase, true);
           const next = a + 4, cnt = n + 1;
           const ret = tgt => 'c.pc = ' + tgt + '; c.ticks += ' + cnt + '; return B + ' + cnt + ';';
@@ -19335,7 +19340,7 @@ registerProcessor('ngbsn-out', NgbsnOut);
               } else if (tgt === pc0) {
                 src.push('c.ticks += ' + cnt + '; B += ' + cnt + '; if (B + ' + cnt + ' <= lim) continue; c.pc = ' + pc0 + '; return B;');
                 self = true; end = true;
-              } else if (hops < 6 && n < A64_JIT_MAX - 8 && tgt >= cBase && tgt <= cEnd) {
+              } else if (hops < (this.maxHops === undefined ? 6 : this.maxHops) && n < (this.maxBlock || A64_JIT_MAX) - 8 && tgt >= cBase && tgt <= cEnd) {
                 // Seguir salto incondicional directo B dentro del mismo bloque (elimina transiciones)
                 hops++; n++; a = tgt; continue;
               } else {
@@ -22356,9 +22361,122 @@ registerProcessor('ngbsn-out', NgbsnOut);
     // ---------------- macros (MME de Fermi) ----------------
     // instruccion de 32 bits: op (0-2), resultado (4-6), salir (7), dst (8-10), srcA (11-13), srcB (14-16), operacion ALU
     // (17-21) o campos de bits (17-21 bit origen, 22-26 tamano, 27-31 bit destino), inmediato con signo (14-31)
+    _mmeEmitOp (op, isLinear) {
+      const kind = op & 7, rop = (op >>> 4) & 7, dst = (op >>> 8) & 7, sa = (op >>> 11) & 7, sbR = (op >>> 14) & 7;
+      const imm = op >> 14;
+      const ra = sa ? ('r' + sa) : '0', rb = sbR ? ('r' + sbR) : '0';
+      let resExpr = '0', pre = '';
+      if (kind === 0) {
+        const alu = (op >>> 17) & 31;
+        switch (alu) {
+          case 0: pre = `_s=${ra}+${rb};c=_s>0xFFFFFFFF?1:0;`; resExpr = '(_s>>>0)'; break;
+          case 1: pre = `_s=${ra}+${rb}+c;c=_s>0xFFFFFFFF?1:0;`; resExpr = '(_s>>>0)'; break;
+          case 2: pre = `_s=${ra}-${rb};c=_s>=0?1:0;`; resExpr = '(_s>>>0)'; break;
+          case 3: pre = `_s=${ra}-${rb}-(1-c);c=_s>=0?1:0;`; resExpr = '(_s>>>0)'; break;
+          case 8: resExpr = `((${ra}^${rb})>>>0)`; break;
+          case 9: resExpr = `((${ra}|${rb})>>>0)`; break;
+          case 10: resExpr = `((${ra}&${rb})>>>0)`; break;
+          case 11: resExpr = `((${ra}&~${rb})>>>0)`; break;
+          case 12: resExpr = `((~(${ra}&${rb}))>>>0)`; break;
+        }
+      } else if (kind === 1) {
+        resExpr = imm ? `((${ra}+(${imm}))>>>0)` : ra;
+      } else if (kind >= 2 && kind <= 4) {
+        const sb = (op >>> 17) & 31, size = (op >>> 22) & 31, db = (op >>> 27) & 31;
+        const mask = size >= 32 ? 0xFFFFFFFF : ((1 << size) - 1) >>> 0;
+        if (kind === 2) {
+          const clr = (~((mask << db) >>> 0)) >>> 0;
+          resExpr = `(((${ra}&${clr})|(((${rb}>>>${sb})&${mask})<<${db}))>>>0)`;
+        } else if (kind === 3) {
+          resExpr = `((((${rb}>>>(${ra}&31))&${mask})<<${db})>>>0)`;
+        } else {
+          resExpr = `((((${rb}>>>${sb})&${mask})<<(${ra}&31))>>>0)`;
+        }
+      } else if (kind === 5) {
+        resExpr = `(r3d[(${ra}+(${imm}))&0xFFF]>>>0)`;
+      }
+      const fetchExpr = '(pi<pl?P[pi++]>>>0:0)';
+      const setDst = val => dst ? `r${dst}=${val};` : '';
+      const sendCode = vExpr => `{const _v=${vExpr},_m=ma&0xFFF;if(_m>7&&(_m<0x6C0||_m>0x6C3)&&_m<0xE00)g.m3d(_m,_v);else nv.handleMethod(sub,_m,_v);ma=(ma+mi)&0xFFF;}`;
+      const setAddrCode = vExpr => `{const _a=${vExpr};ma=_a&0xFFF;mi=(_a>>>12)&0x3F;}`;
+      let body = pre;
+      if (rop === 0) body += setDst(fetchExpr);
+      else if (rop === 1) body += setDst(resExpr);
+      else if (rop === 2) body += `{const _r=${resExpr};${setDst('_r')}${setAddrCode('_r')}}`;
+      else if (rop === 3) body += `{const _r=${resExpr};${setDst(fetchExpr)}${sendCode('_r')}}`;
+      else if (rop === 4) body += `{const _r=${resExpr};${setDst('_r')}${sendCode('_r')}}`;
+      else if (rop === 5) body += `{const _r=${resExpr};${setDst(fetchExpr)}${setAddrCode('_r')}}`;
+      else if (rop === 6) body += `{const _r=${resExpr};${setDst('_r')}${setAddrCode('_r')}${sendCode(fetchExpr)}}`;
+      else if (rop === 7) body += `{const _r=${resExpr};${setDst('_r')}${setAddrCode('_r')}${sendCode('(_r>>>12)&0x3F')}}`;
+      void isLinear;
+      return body;
+    }
+    compileMacro (id) {
+      const code = this.macroCode, start = this.macroStart[id] || 0;
+      // comprobar si es lineal (sin saltos kind===7 antes de exit + hueco de retardo)
+      let linear = true, linLen = 0, exitSeen = false;
+      for (let k = 0; k < 128; k++) {
+        const op = code[(start + k) & 0x1FFF] >>> 0;
+        if ((op & 7) === 7) { linear = false; break; }
+        linLen++;
+        if (exitSeen) break;
+        if (op & 0x80) exitSeen = true;
+      }
+      if (linear && exitSeen) {
+        const lines = ['const r3d=g.r3d,nv=g.nv,pl=P.length;let pi=0,ma=0,mi=0,c=0,_s=0,r1=pl?P[pi++]>>>0:0,r2=0,r3=0,r4=0,r5=0,r6=0,r7=0;'];
+        for (let k = 0; k < linLen; k++) lines.push(this._mmeEmitOp(code[(start + k) & 0x1FFF] >>> 0, true));
+        try { return new Function('g', 'P', 'sub', lines.join('\n')); } catch (e) { return null; }
+      }
+      // macro con saltos: BFS de PCs alcanzables y switch pre-decodificado
+      const seen = new Set(), q = [start & 0x1FFF];
+      seen.add(start & 0x1FFF);
+      while (q.length && seen.size <= 256) {
+        const pc = q.shift(), op = code[pc] >>> 0, kind = op & 7;
+        const n1 = (pc + 1) & 0x1FFF;
+        if (!seen.has(n1)) { seen.add(n1); q.push(n1); }
+        if (kind === 7) {
+          const tgt = (pc + (op >> 14)) & 0x1FFF;
+          if (!seen.has(tgt)) { seen.add(tgt); q.push(tgt); }
+        }
+        if (op & 0x80) {
+          // el hueco de retardo (pc+1) ya se ha anadido arriba; no seguir mas alla salvo que otro salto entre ahi
+          continue;
+        }
+      }
+      if (seen.size > 256) return null;
+      const lines = [
+        'const r3d=g.r3d,nv=g.nv,pl=P.length;let pi=0,ma=0,mi=0,c=0,_s=0,r1=pl?P[pi++]>>>0:0,r2=0,r3=0,r4=0,r5=0,r6=0,r7=0;',
+        `let pc=${start & 0x1FFF},nx=${(start + 1) & 0x1FFF},ex=0;`,
+        'for(let _st=0;_st<100000;_st++){switch(pc){'
+      ];
+      for (const pc of seen) {
+        const op = code[pc] >>> 0, kind = op & 7, isEx = (op & 0x80) !== 0;
+        if (kind === 7) {
+          const sa = (op >>> 11) & 7, ra = sa ? ('r' + sa) : '0', nz = (op >>> 4) & 1, noDelay = (op >>> 5) & 1;
+          const tgt = (pc + (op >> 14)) & 0x1FFF;
+          const cond = nz ? `(${ra}!==0)` : `(${ra}===0)`;
+          const br = noDelay ? `pc=${tgt};nx=${(tgt + 1) & 0x1FFF};` : `pc=nx;nx=${tgt};`;
+          const nbr = `pc=nx;nx=(pc+1)&0x1FFF;`;
+          const exCode = isEx ? 'if(ex)return;ex=1;' : '';
+          lines.push(`case ${pc}:if(${cond}){${br}}else{${nbr}}${exCode}continue;`);
+        } else {
+          const body = this._mmeEmitOp(op, false);
+          const exCode = isEx ? 'if(ex)return;ex=1;' : 'if(ex)return;';
+          lines.push(`case ${pc}:${body}${exCode}pc=nx;nx=(pc+1)&0x1FFF;break;`);
+        }
+      }
+      lines.push('default:return;}}');
+      try { return new Function('g', 'P', 'sub', lines.join('\n')); } catch (e) { return null; }
+    }
     runMacro (id, params, sub) {
       this.stats.macros++;
-      const code = this.macroCode, R = new Uint32Array(8);
+      let fns = this.macroFns;
+      if (!fns) fns = this.macroFns = new Array(128);
+      let fn = fns[id];
+      if (fn === undefined) fn = fns[id] = this.compileMacro(id);
+      if (fn) { fn(this, params, sub); return; }
+      const code = this.macroCode, R = this._macroR || (this._macroR = new Uint32Array(8));
+      R.fill(0);
       let pc = this.macroStart[id] || 0, next = pc + 1, pi = 0, maddr = 0, minc = 0, carry = 0, exitAfter = false;
       const fetch = () => pi < params.length ? params[pi++] >>> 0 : 0;
       const send = v => { this.nv.handleMethod(sub, maddr & 0xFFF, v >>> 0); maddr = (maddr + minc) & 0xFFF; };
@@ -22425,14 +22543,27 @@ registerProcessor('ngbsn-out', NgbsnOut);
       R[m & 0x7F] = d;
       if (m === 0x6C) {                                        // LAUNCH_DMA
         const len = R[0x60], lines = R[0x61] || 1, dst = R[0x62] * 4294967296 + R[0x63];
-        this.inl = { dst, len, lines, pitch: R[0x64] || len, pos: 0, total: len * lines, linear: (d & 1) !== 0 || true };
-        this.markWrite(dst, (R[0x64] || len) * lines);
+        const pitch = R[0x64] || len, total = len * lines;
+        const sp = (lines === 1 || pitch === len) ? this.span(dst, total) : null;
+        this.inl = { dst, len, lines, pitch, pos: 0, total, linear: true, u8: sp && !sp.copy ? sp.u8 : null, off: sp ? sp.off : 0 };
+        this.markWrite(dst, pitch * lines);
         this.stats.inline++;
       } else if (m === 0x6D && this.inl) {                     // LOAD_INLINE_DATA
         const L = this.inl;
-        for (let k = 0; k < 4 && L.pos < L.total; k++, L.pos++) {
-          const line = Math.floor(L.pos / L.len), x = L.pos % L.len, a = this.cpu(L.dst + line * L.pitch + x);
-          if (a !== null) this.sys.mem.w8(a, (d >>> (8 * k)) & 0xFF);
+        if (L.u8) {
+          const u8 = L.u8, p = L.off + L.pos, rem = L.total - L.pos;
+          if (rem >= 4) {
+            u8[p] = d & 0xFF; u8[p + 1] = (d >>> 8) & 0xFF; u8[p + 2] = (d >>> 16) & 0xFF; u8[p + 3] = (d >>> 24) & 0xFF;
+            L.pos += 4;
+          } else {
+            for (let k = 0; k < rem; k++) u8[p + k] = (d >>> (8 * k)) & 0xFF;
+            L.pos += rem;
+          }
+        } else {
+          for (let k = 0; k < 4 && L.pos < L.total; k++, L.pos++) {
+            const line = Math.floor(L.pos / L.len), x = L.pos % L.len, a = this.cpu(L.dst + line * L.pitch + x);
+            if (a !== null) this.sys.mem.w8(a, (d >>> (8 * k)) & 0xFF);
+          }
         }
         if (L.pos >= L.total) this.inl = null;
       }
@@ -22471,8 +22602,54 @@ registerProcessor('ngbsn-out', NgbsnOut);
       const sSp = this.span(src, srcPitch ? pIn * (lines - 1) + bytes : sT.size), dSp = this.span(dst, dstPitch ? pOut * (lines - 1) + bytes : dT.size);
       if (sSp && dSp) {
         const su = sSp.u8, du = dSp.u8, so = sSp.off, dO = dSp.off;
+        if (srcPitch && dstPitch) {
+          for (let y = 0; y < lines; y++) du.set(su.subarray(so + y * pIn, so + y * pIn + bytes), dO + y * pOut);
+          return;
+        }
+        // Copia rapida bloque-lineal <-> bloque-lineal con el mismo formato
+        if (!srcPitch && !dstPitch && sW === dW && sBH === dBH && sx0 === 0 && sy0 === 0 && dx0 === 0 && dy0 === 0 && bytes === sW && lines === sH && sT.size === dT.size) {
+          du.set(su.subarray(so, so + sT.size), dO);
+          return;
+        }
+        // En Tegra X1 Block Linear, cada 16 bytes alineados (x & 15 === 0) son contiguos en memoria: copiar de 16 en 16 (4 x Uint32)
+        const sAligned = ((su.byteOffset + so) & 3) === 0 && (!srcPitch || (pIn & 3) === 0);
+        const dAligned = ((du.byteOffset + dO) & 3) === 0 && (!dstPitch || (pOut & 3) === 0);
+        if (sAligned && dAligned && (bytes & 15) === 0 && (srcPitch || (sx0 & 15) === 0) && (dstPitch || (dx0 & 15) === 0)) {
+          const su32 = new Uint32Array(su.buffer, su.byteOffset + so, (su.byteLength - so) >>> 2);
+          const du32 = new Uint32Array(du.buffer, du.byteOffset + dO, (du.byteLength - dO) >>> 2);
+          if (!srcPitch && dstPitch) {
+            const sRow = sT.row, sCol = sT.col, pOut4 = pOut >>> 2;
+            for (let y = 0; y < lines; y++) {
+              const sr = sRow[sy0 + y] >>> 2, dr = y * pOut4;
+              for (let x = 0; x < bytes; x += 16) {
+                const sa = sr + (sCol[sx0 + x] >>> 2), da = dr + (x >>> 2);
+                du32[da] = su32[sa]; du32[da + 1] = su32[sa + 1]; du32[da + 2] = su32[sa + 2]; du32[da + 3] = su32[sa + 3];
+              }
+            }
+            return;
+          }
+          if (srcPitch && !dstPitch) {
+            const dRow = dT.row, dCol = dT.col, pIn4 = pIn >>> 2;
+            for (let y = 0; y < lines; y++) {
+              const sr = y * pIn4, dr = dRow[dy0 + y] >>> 2;
+              for (let x = 0; x < bytes; x += 16) {
+                const sa = sr + (x >>> 2), da = dr + (dCol[dx0 + x] >>> 2);
+                du32[da] = su32[sa]; du32[da + 1] = su32[sa + 1]; du32[da + 2] = su32[sa + 2]; du32[da + 3] = su32[sa + 3];
+              }
+            }
+            return;
+          }
+          const sRow = sT.row, sCol = sT.col, dRow = dT.row, dCol = dT.col;
+          for (let y = 0; y < lines; y++) {
+            const sr = sRow[sy0 + y] >>> 2, dr = dRow[dy0 + y] >>> 2;
+            for (let x = 0; x < bytes; x += 16) {
+              const sa = sr + (sCol[sx0 + x] >>> 2), da = dr + (dCol[dx0 + x] >>> 2);
+              du32[da] = su32[sa]; du32[da + 1] = su32[sa + 1]; du32[da + 2] = su32[sa + 2]; du32[da + 3] = su32[sa + 3];
+            }
+          }
+          return;
+        }
         for (let y = 0; y < lines; y++) {
-          if (srcPitch && dstPitch) { du.set(su.subarray(so + y * pIn, so + y * pIn + bytes), dO + y * pOut); continue; }
           const sr = srcPitch ? so + y * pIn : so + sT.row[sy0 + y], dr = dstPitch ? dO + y * pOut : dO + dT.row[dy0 + y];
           for (let x = 0; x < bytes; x++) du[dr + (dstPitch ? x : dT.col[dx0 + x])] = su[sr + (srcPitch ? x : sT.col[sx0 + x])];
         }
@@ -22582,9 +22759,9 @@ registerProcessor('ngbsn-out', NgbsnOut);
       if (m >= 0x60 && m <= 0x6D) { this.minline(R, m, d); return; }
       switch (m) {
         case 0x45: this.mcodePos = d; break;                                // MME_INSTRUCTION_RAM_POINTER
-        case 0x46: this.macroCode[this.mcodePos++ & 0x1FFF] = d; break;     // MME_INSTRUCTION_RAM_LOAD
+        case 0x46: this.macroCode[this.mcodePos++ & 0x1FFF] = d; this.macroFns = null; break; // MME_INSTRUCTION_RAM_LOAD
         case 0x47: this.mstartPos = d; break;                               // MME_START_ADDRESS_RAM_POINTER
-        case 0x48: this.macroStart[this.mstartPos++ & 0x7F] = d; break;     // MME_START_ADDRESS_RAM_LOAD
+        case 0x48: this.macroStart[this.mstartPos++ & 0x7F] = d; this.macroFns = null; break; // MME_START_ADDRESS_RAM_LOAD
         case 0x8E3: this.cbPos = d; break;                                  // CB_POS
         case 0x586:                                                         // VERTEX_BEGIN_GL (instancias NVN: bit 26 = next, bit 27 = cont)
           this.prim = d; this.indexed = false;
@@ -22608,8 +22785,27 @@ registerProcessor('ngbsn-out', NgbsnOut);
         case 0x674: this.clear(d); break;                                   // CLEAR_BUFFERS
         default:
           if (m >= 0x8E4 && m <= 0x8F3) {                                   // CB_DATA: a la memoria del bufer de constantes
-            const a = R[0x8E1] * 4294967296 + R[0x8E2];
-            this.w32(a + this.cbPos, d); this.cbPos += 4; R[0x8E3] = this.cbPos;
+            const a = R[0x8E1] * 4294967296 + R[0x8E2], pos = this.cbPos;
+            const mem = this.sys.mem;
+            if (a !== this._cbGva || mem.gen !== this._cbGen || pos + 4 > this._cbMax) {
+              this._cbGva = a; this._cbGen = mem.gen; this._cbU32 = null; this._cbMax = 0;
+              const cpu = this.cpu(a);
+              if (cpu !== null && (cpu & 3) === 0 && mem.find) {
+                const rg = mem.find(cpu);
+                if (rg) {
+                  if (rg.sparse) {
+                    const off = cpu - rg.base, co = off & rg.chunkMask;
+                    const c = mem._spChunk(rg, off, true);
+                    if (c && c.u32) { this._cbU32 = c.u32; this._cbIdx = co >>> 2; this._cbMax = rg.chunkSize - co; }
+                  } else if (rg.u32) {
+                    this._cbU32 = rg.u32; this._cbIdx = (cpu - rg.base) >>> 2; this._cbMax = rg.end - cpu;
+                  }
+                }
+              }
+            }
+            if (this._cbU32 && (pos & 3) === 0 && pos + 4 <= this._cbMax) this._cbU32[this._cbIdx + (pos >>> 2)] = d;
+            else this.w32(a + pos, d);
+            this.cbPos = pos + 4; R[0x8E3] = this.cbPos;
           } else if (m >= 0x904 && m < 0x904 + 8 * 5 && ((m - 0x904) & 7) === 0) this.cbBind((m - 0x904) >> 3, d);   // CB_BIND(etapa)
       }
     }
@@ -22934,11 +23130,14 @@ registerProcessor('ngbsn-out', NgbsnOut);
     let n = words.length >> 1;
     const ins = [];
     for (let i = 0; i < n; i++) ins.push([words[2 * i] >>> 0, words[2 * i + 1] >>> 0]);
-    let end = n;
+    let maxT = 0, end = n, branches = false;
     for (let i = 0; i < n; i++) {
       if ((i & 3) === 0) continue;
-      const [lo, hi] = ins[i];
-      if (((hi & 0xFFF00000) >>> 0) === 0xE3000000 && ((lo >>> 16) & 15) === 7) { end = i + 1; break; }
+      const [lo, hi] = ins[i], t12 = (hi & 0xFFF00000) >>> 0;
+      if (t12 === 0xE2400000 || t12 === 0xE2600000 || t12 === 0xE2900000 || t12 === 0xE2A00000) {
+        branches = true; const tg = i + 1 + nxBranchOff(lo, hi); if (tg > maxT && tg < n) maxT = tg;
+      } else if (t12 === 0xE2500000) { branches = true; }
+      if (t12 === 0xE3000000 && ((lo >>> 16) & 15) === 7 && i >= maxT) { end = i + 1; break; }
     }
     const fLit = u => {
       const f = nxshF(u);
@@ -22946,14 +23145,18 @@ registerProcessor('ngbsn-out', NgbsnOut);
       return (f.includes('.') || f.includes('e') || f.includes('E')) ? f : (f + '.0');
     };
     const R = r => (r === 255 || r >= 64) ? '0.0' : ('R[' + r + ']');
+    const RU = r => (r === 255 || r >= 64) ? '0u' : ('floatBitsToUint(R[' + r + '])');
+    const RI = r => (r === 255 || r >= 64) ? '0' : ('floatBitsToInt(R[' + r + '])');
     const W = (r, e) => (r === 255 || r >= 64) ? '' : ('R[' + r + '] = ' + e + ';');
-    const cbBanks = new Set(), texSlots = [], texMap = new Map();
-    let maxAttr = -1, ok = true;
+    const WU = (r, e) => (r === 255 || r >= 64) ? '' : ('R[' + r + '] = uintBitsToFloat(' + e + ');');
+    const cbList = [], cbMap = new Map(), texSlots = [], texMap = new Map();
+    let maxAttr = -1, ok = true, usesLdc = false, ldcBank = 1;
     const stmts = [];
     const getTexUnit = slot => {
       if (!texMap.has(slot)) { if (texSlots.length >= 4) { ok = false; return 0; } texMap.set(slot, texSlots.length); texSlots.push(slot); }
       return texMap.get(slot);
     };
+    const predE = (pp, pneg) => pp === 7 ? (pneg ? 'false' : 'true') : ((pneg ? '!' : '') + 'P[' + pp + ']');
     for (let i = 0; i < end && ok; i++) {
       if ((i & 3) === 0) continue;
       const [lo, hi] = ins[i];
@@ -22961,22 +23164,31 @@ registerProcessor('ngbsn-out', NgbsnOut);
       const fld = (k, l) => k + l <= 32 ? ((lo >>> k) & ((1 << l) - 1)) : k >= 32 ? ((hi >>> (k - 32)) & ((1 << l) - 1)) : (((lo >>> k) | (hi << (32 - k))) & ((1 << l) - 1));
       const d = lo & 255, a = (lo >>> 8) & 255, pg = (lo >>> 16) & 7, pn = (lo >>> 19) & 1, b = (lo >>> 20) & 255, c = fld(39, 8);
       const cbOff = fld(20, 14), cbBank = fld(34, 5), imm19 = fld(20, 19) | (bit(56) ? (1 << 19) : 0);
+      const immS = bit(56) ? (fld(20, 19) - 0x80000) : fld(20, 19);
       const immF = () => fLit((imm19 & 0xFFFFF) << 12);
       const cbRef = () => {
-        if (cbBank >= 4 || cbOff >= 64) { ok = false; return '0.0'; }
-        cbBanks.add(cbBank);
-        const idx = cbBank * 64 + cbOff;
+        const key = (cbBank << 16) | cbOff;
+        let idx = cbMap.get(key);
+        if (idx === undefined) {
+          if (cbList.length >= 256) { ok = false; return '0.0'; }
+          idx = cbList.length; cbMap.set(key, idx); cbList.push([cbBank, cbOff]);
+        }
         return 'uCB[' + (idx >> 2) + '][' + (idx & 3) + ']';
       };
       const t12 = (hi & 0xFFF00000) >>> 0, t13 = (hi & 0xFFF80000) >>> 0, ti = (hi & 0xFEF80000) >>> 0;
       const is3 = (rr, rc, ri) => t13 === rr || t13 === rc || ti === ri;
       const bf = (rr, rc) => t13 === rr ? R(b) : t13 === rc ? cbRef() : immF();
+      const bu = (rr, rc) => t13 === rr ? RU(b) : t13 === rc ? ('floatBitsToUint(' + cbRef() + ')') : ((immS >>> 0) + 'u');
       const mod = (e, neg, abs) => (abs ? 'abs(' + e + ')' : e) && (neg ? '-(' + (abs ? 'abs(' + e + ')' : e) + ')' : (abs ? 'abs(' + e + ')' : e));
       let s = '';
       if (t12 === 0xE3000000) { s = 'oCol = vec4(R[0], R[1], R[2], R[3]); return;'; }
       else if (t12 === 0xE3300000) { s = 'discard;'; }
+      else if (t12 === 0xE2400000 || t12 === 0xE2600000) { s = '_pc = ' + (i + 1 + nxBranchOff(lo, hi)) + '; continue;'; }
+      else if (t12 === 0xE2500000) { s = '_pc = ' + (i + 1 + nxBranchOff(lo, hi)) + ' + (' + RI(a) + ' >> 3); continue;'; }
+      else if (t12 === 0xE2900000 || t12 === 0xE2A00000) { s = 'if (_sp < 16) _stk[_sp++] = ' + (i + 1 + nxBranchOff(lo, hi)) + ';'; }
+      else if (t13 === 0xF0F80000 || t12 === 0xE3400000 || t12 === 0xE3200000) { s = '_pc = _sp > 0 ? _stk[--_sp] : 99999; continue;'; }
       else if (t13 === 0x5C980000 || t13 === 0x4C980000 || ((hi & 0xFEF80000) >>> 0) === 0x38980000) { s = W(d, t13 === 0x5C980000 ? R(b) : t13 === 0x4C980000 ? cbRef() : immF()); }
-      else if (t12 === 0x01000000) { s = W(d, fLit((lo >>> 20) | ((hi & 0xFFFFF) << 12))); }
+      else if (t12 === 0x01000000) { s = WU(d, (((lo >>> 20) | ((hi & 0xFFFFF) << 12)) >>> 0) + 'u'); }
       else if (((hi & 0xFC000000) >>> 0) === 0x08000000) {
         let e = mod(R(a), bit(56), bit(54)) + ' + ' + fLit((lo >>> 20) | ((hi & 0xFFFFF) << 12));
         if (bit(55)) e = 'clamp(' + e + ', 0.0, 1.0)';
@@ -22992,16 +23204,23 @@ registerProcessor('ngbsn-out', NgbsnOut);
       } else if (is3(0x5C900000, 0x4C900000, 0x38900000)) { s = W(d, bf(0x5C900000, 0x4C900000)); }
       else if (is3(0x5CA80000, 0x4CA80000, 0x38A80000)) {
         let e = mod(bf(0x5CA80000, 0x4CA80000), bit(45), bit(49));
+        if (bit(42)) e = ['round(' + e + ')', 'floor(' + e + ')', 'ceil(' + e + ')', 'trunc(' + e + ')'][(hi >>> 7) & 3];
         if (bit(50)) e = 'clamp(' + e + ', 0.0, 1.0)';
         s = W(d, e);
+      } else if (is3(0x5CB80000, 0x4CB80000, 0x38B80000)) {
+        s = W(d, bit(13) ? ('float(int(' + bu(0x5CB80000, 0x4CB80000) + '))') : ('float(' + bu(0x5CB80000, 0x4CB80000) + ')'));
+      } else if (is3(0x5CB00000, 0x4CB00000, 0x38B00000)) {
+        s = WU(d, bit(12) ? ('uint(int(' + bf(0x5CB00000, 0x4CB00000) + '))') : ('uint(max(' + bf(0x5CB00000, 0x4CB00000) + ', 0.0))'));
       }
       else if (is3(0x5C580000, 0x4C580000, 0x38580000)) {
         let e = mod(R(a), bit(48), bit(46)) + ' + ' + mod(bf(0x5C580000, 0x4C580000), bit(45), bit(49));
         if (bit(50)) e = 'clamp(' + e + ', 0.0, 1.0)';
         s = W(d, e);
       } else if (is3(0x5C680000, 0x4C680000, 0x38680000)) {
+        const mul = [1, 0.5, 0.25, 0.125, 1, 2, 4, 8][(hi >>> 9) & 7];
         let e = '(' + R(a) + ' * ' + bf(0x5C680000, 0x4C680000) + ')';
         if (bit(48)) e = '(-' + e + ')';
+        if (mul !== 1) e = '(' + e + ' * ' + mul + '.0)'.replace('.0.0', '.0').replace('0.5.0', '0.5').replace('0.25.0', '0.25').replace('0.125.0', '0.125');
         if (bit(50)) e = 'clamp(' + e + ', 0.0, 1.0)';
         s = W(d, e);
       } else if (((hi & 0xFF800000) >>> 0) === 0x59800000 || ((hi & 0xFF800000) >>> 0) === 0x49800000 || ((hi & 0xFF800000) >>> 0) === 0x51800000 || ((hi & 0xFE800000) >>> 0) === 0x32800000) {
@@ -23014,33 +23233,84 @@ registerProcessor('ngbsn-out', NgbsnOut);
         s = W(d, e);
       } else if (is3(0x5C600000, 0x4C600000, 0x38600000)) {
         const A = mod(R(a), bit(48), bit(46)), B = mod(bf(0x5C600000, 0x4C600000), bit(45), bit(49));
-        const pp = fld(39, 3), pneg = bit(42);
-        const cond = pp === 7 ? (pneg ? 'false' : 'true') : ((pneg ? '!' : '') + 'P[' + pp + ']');
+        const cond = predE(fld(39, 3), bit(42));
         s = W(d, '(' + cond + ' ? min(' + A + ', ' + B + ') : max(' + A + ', ' + B + '))');
       } else if (is3(0x5CA00000, 0x4CA00000, 0x38A00000)) {
-        const B = bf(0x5CA00000, 0x4CA00000), pp = fld(39, 3), pneg = bit(42);
-        const cond = pp === 7 ? (pneg ? 'false' : 'true') : ((pneg ? '!' : '') + 'P[' + pp + ']');
+        const B = bf(0x5CA00000, 0x4CA00000), cond = predE(fld(39, 3), bit(42));
         s = W(d, '(' + cond + ' ? ' + R(a) + ' : ' + B + ')');
       } else if (t12 === 0x5BB00000 || t12 === 0x4BB00000 || ((hi & 0xFEF00000) >>> 0) === 0x36B00000) {
         const cmp = fld(48, 4), p0 = fld(3, 3), p1 = fld(0, 3);
         const A = mod(R(a), bit(43), bit(7)), B = mod(t12 === 0x5BB00000 ? R(b) : t12 === 0x4BB00000 ? cbRef() : immF(), bit(6), bit(44));
         const ops = ['false', A + ' < ' + B, A + ' == ' + B, A + ' <= ' + B, A + ' > ' + B, A + ' != ' + B, A + ' >= ' + B, 'true'];
         const t = ops[cmp & 7];
-        s = '{ bool _t = (' + t + ');' + (p0 < 7 ? ' P[' + p0 + '] = _t;' : '') + (p1 < 7 ? ' P[' + p1 + '] = !_t;' : '') + ' }';
+        const se = predE(fld(39, 3), bit(42)), op = (hi >>> 13) & 3;
+        const comb = v => op === 0 ? '(' + v + ' && ' + se + ')' : op === 1 ? '(' + v + ' || ' + se + ')' : '(' + v + ' != ' + se + ')';
+        s = '{ bool _t = (' + t + ');' + (p0 < 7 ? ' P[' + p0 + '] = ' + comb('_t') + ';' : '') + (p1 < 7 ? ' P[' + p1 + '] = ' + comb('!_t') + ';' : '') + ' }';
       } else if (t12 === 0x5B600000 || t12 === 0x4B600000 || ((hi & 0xFEF00000) >>> 0) === 0x36600000) {
         const cmp = (hi >>> 17) & 7, sg = bit(48), p0 = fld(3, 3), p1 = fld(0, 3);
         const cvt = sg ? 'floatBitsToInt' : 'floatBitsToUint';
         const A = a === 255 ? (sg ? '0' : '0u') : (cvt + '(' + R(a) + ')');
-        const immS = bit(56) ? (fld(20, 19) - 0x80000) : fld(20, 19);
         const B = t12 === 0x5B600000 ? (b === 255 ? (sg ? '0' : '0u') : (cvt + '(' + R(b) + ')'))
           : t12 === 0x4B600000 ? (cvt + '(' + cbRef() + ')')
           : (sg ? String(immS) : ((immS >>> 0) + 'u'));
         const ops = ['false', A + ' < ' + B, A + ' == ' + B, A + ' <= ' + B, A + ' > ' + B, A + ' != ' + B, A + ' >= ' + B, 'true'];
         const t = ops[cmp & 7];
-        s = '{ bool _t = (' + t + ');' + (p0 < 7 ? ' P[' + p0 + '] = _t;' : '') + (p1 < 7 ? ' P[' + p1 + '] = !_t;' : '') + ' }';
+        const se = predE(fld(39, 3), bit(42)), op = (hi >>> 13) & 3;
+        const comb = v => op === 0 ? '(' + v + ' && ' + se + ')' : op === 1 ? '(' + v + ' || ' + se + ')' : '(' + v + ' != ' + se + ')';
+        s = '{ bool _t = (' + t + ');' + (p0 < 7 ? ' P[' + p0 + '] = ' + comb('_t') + ';' : '') + (p1 < 7 ? ' P[' + p1 + '] = ' + comb('!_t') + ';' : '') + ' }';
+      } else if (t13 === 0x50900000) {
+        const p0 = (lo >>> 3) & 7, p1 = lo & 7;
+        const pa = predE((lo >>> 12) & 7, bit(15)), pb = predE((lo >>> 29) & 7, bit(32)), pc2 = predE((hi >>> 7) & 7, bit(42));
+        const op1 = (lo >>> 24) & 3, op2 = (hi >>> 13) & 3;
+        const comb = (x, y, o) => o === 0 ? '(' + x + ' && ' + y + ')' : o === 1 ? '(' + x + ' || ' + y + ')' : '(' + x + ' != ' + y + ')';
+        const r0 = comb(comb(pa, pb, op1), pc2, op2), r1 = comb('!' + comb(pa, pb, op1), pc2, op2);
+        s = (p0 < 7 ? 'P[' + p0 + '] = ' + r0 + ';' : '') + (p1 < 7 ? 'P[' + p1 + '] = ' + r1 + ';' : '');
+      } else if (is3(0x5C100000, 0x4C100000, 0x38100000)) {
+        let x = RU(a), y = bu(0x5C100000, 0x4C100000);
+        if (bit(49)) x = '(0u - ' + x + ')'; if (bit(48)) y = '(0u - ' + y + ')';
+        s = WU(d, '(' + x + ' + ' + y + ')');
+      } else if (((hi & 0xFC000000) >>> 0) === 0x1C000000) {
+        s = WU(d, '(' + RU(a) + ' + ' + (((lo >>> 20) | ((hi & 0xFFFFF) << 12)) >>> 0) + 'u)');
+      } else if (is3(0x5C480000, 0x4C480000, 0x38480000)) {
+        s = WU(d, '(' + RU(a) + ' << (' + bu(0x5C480000, 0x4C480000) + ' & 31u))');
+      } else if (is3(0x5C280000, 0x4C280000, 0x38280000)) {
+        const sh = '(' + bu(0x5C280000, 0x4C280000) + ' & 31u)';
+        s = WU(d, bit(48) ? ('uint(' + RI(a) + ' >> int(' + sh + '))') : ('(' + RU(a) + ' >> ' + sh + ')'));
+      } else if (is3(0x5C200000, 0x4C200000, 0x38200000)) {
+        const sg = bit(48), cond = predE(fld(39, 3), bit(42));
+        const x = sg ? RI(a) : RU(a), y = sg ? ('int(' + bu(0x5C200000, 0x4C200000) + ')') : bu(0x5C200000, 0x4C200000);
+        const e = '(' + cond + ' ? min(' + x + ', ' + y + ') : max(' + x + ', ' + y + '))';
+        s = WU(d, sg ? ('uint(' + e + ')') : e);
+      } else if (((hi & 0xFF800000) >>> 0) === 0x5B000000 || ((hi & 0xFF800000) >>> 0) === 0x4E000000 || ((hi & 0xFE000000) >>> 0) === 0x36000000) {
+        const top = (hi & 0xFF800000) >>> 0;
+        const hiA = bit(53), hiB = bit(35), psl = bit(36), mrg = bit(37);
+        const sa = hiA ? ('(' + RU(a) + ' >> 16u)') : ('(' + RU(a) + ' & 65535u)');
+        const rawB = top === 0x5B000000 ? RU(b) : top === 0x4E000000 ? ('floatBitsToUint(' + cbRef() + ')') : ((imm19 & 65535) + 'u');
+        const sb = (top !== 0x36000000 && hiB) ? ('(' + rawB + ' >> 16u)') : ('(' + rawB + ' & 65535u)');
+        let prod = '(' + sa + ' * ' + sb + ')';
+        if (psl) prod = '(' + prod + ' << 16u)';
+        s = mrg ? WU(d, '(((' + prod + ' + ' + RU(c) + ') & 65535u) | ((' + rawB + ' & 65535u) << 16u))') : WU(d, '(' + prod + ' + ' + RU(c) + ')');
+      } else if (is3(0x5BE00000, 0x4BE00000, 0x36E00000)) {
+        const lut = (hi >>> 16) & 0xFF;
+        s = '{ uint _a = ' + RU(a) + ', _b = ' + bu(0x5BE00000, 0x4BE00000) + ', _c = ' + RU(c) + ', _r = 0u;';
+        for (let m = 0; m < 8; m++) if (lut & (1 << m)) {
+          s += ' _r |= (' + ((m & 4) ? '_a' : '~_a') + ' & ' + ((m & 2) ? '_b' : '~_b') + ' & ' + ((m & 1) ? '_c' : '~_c') + ');';
+        }
+        s += ' ' + WU(d, '_r') + ' }';
+      } else if (t13 === 0xEF900000) {
+        const bank = (hi >>> 4) & 31, off16 = ((lo >>> 20) | ((hi & 0xF) << 12)), sOff = (off16 & 0x8000) ? (off16 - 0x10000) : off16;
+        const sz = (hi >>> 16) & 7, cnt = sz === 5 ? 2 : sz === 6 ? 4 : 1;
+        usesLdc = true; ldcBank = bank;
+        s = '{ int _ci = (int(' + RU(a) + ') + ' + sOff + ') >> 2;';
+        for (let k = 0; k < cnt; k++) if (d + k < 64) {
+          s += ' int _k' + k + ' = clamp(_ci + ' + k + ', 0, 127); R[' + (d + k) + '] = uLdc[_k' + k + ' >> 2][_k' + k + ' & 3];';
+        }
+        s += ' }';
+      } else if (((hi & 0xFC000000) >>> 0) === 0x04000000) {
+        const op = (hi >>> 21) & 3, iv = (((lo >>> 20) | ((hi & 0xFFFFF) << 12)) >>> 0) + 'u';
+        s = WU(d, '(' + RU(a) + [' & ', ' | ', ' ^ ', ' & '][op] + iv + ')');
       } else if (is3(0x5C400000, 0x4C400000, 0x38400000)) {
         const op = (hi >>> 9) & 3;
-        const immS = bit(56) ? (fld(20, 19) - 0x80000) : fld(20, 19);
         let A = a === 255 ? '0u' : ('floatBitsToUint(' + R(a) + ')');
         let B = t13 === 0x5C400000 ? (b === 255 ? '0u' : ('floatBitsToUint(' + R(b) + ')'))
           : t13 === 0x4C400000 ? ('floatBitsToUint(' + cbRef() + ')')
@@ -23103,7 +23373,8 @@ registerProcessor('ngbsn-out', NgbsnOut);
         ok = false; break;
       }
       if (s && (pg !== 7 || pn)) s = (pg === 7 ? 'if (false) {' : 'if (' + (pn ? '!' : '') + 'P[' + pg + ']) {') + s + '}';
-      if (s) stmts.push(s);
+      if (branches) stmts.push('case ' + i + ': ' + s);
+      else if (s) stmts.push(s);
     }
     if (!ok || !stmts.length) return null;
     const hdr = [
@@ -23111,16 +23382,22 @@ registerProcessor('ngbsn-out', NgbsnOut);
       'precision highp float;',
       'in vec4 vA0; in vec4 vA1; in vec4 vA2; in vec4 vA3;',
       'uniform vec4 uCB[64];',
+      usesLdc ? 'uniform vec4 uLdc[32];' : '',
       'uniform sampler2D uTex0; uniform sampler2D uTex1; uniform sampler2D uTex2; uniform sampler2D uTex3;',
       'out vec4 oCol;',
       'void main () {',
       '  float R[64]; for (int i = 0; i < 64; i++) R[i] = 0.0;',
       '  bool P[8]; for (int i = 0; i < 8; i++) P[i] = false; P[7] = true;'
     ];
+    let body;
+    if (!branches) body = '  ' + stmts.join('\n  ');
+    else body = '  int _pc = 1, _sp = 0; int _stk[16];\n  for (int _it = 0; _it < 512; _it++) {\n    switch (_pc) {\n      ' + stmts.join('\n      ') + '\n      default: if (_pc < ' + end + ' && (_pc & 3) == 0) { _pc++; continue; } oCol = vec4(R[0], R[1], R[2], R[3]); return;\n    }\n  }';
     return {
-      glsl: hdr.join('\n') + '\n  ' + stmts.join('\n  ') + '\n  oCol = vec4(R[0], R[1], R[2], R[3]);\n}\n',
+      glsl: hdr.filter(Boolean).join('\n') + '\n' + body + '\n  oCol = vec4(R[0], R[1], R[2], R[3]);\n}\n',
       texSlots,
-      cbBanks: [...cbBanks],
+      cbList,
+      cbBanks: [...new Set(cbList.map(x => x[0]))],
+      ldcBank: usesLdc ? ldcBank : -1,
       maxAttr
     };
   }
@@ -23784,9 +24061,15 @@ registerProcessor('ngbsn-out', NgbsnOut);
     // ---------------- destino ----------------
     target (rtIdx = 0) {
       const g = this.gpu, R = g.r3d, rb = 0x200 + (rtIdx & 7) * 16;
-      const addr = R[rb] * 4294967296 + R[rb + 1], W = R[rb + 2], H = R[rb + 3], fmt = R[rb + 4] & 0xFF, bh = 1 << ((R[rb + 5] >>> 4) & 15);
+      const r0 = R[rb], r1 = R[rb + 1], W = R[rb + 2], H = R[rb + 3], r4 = R[rb + 4], r5 = R[rb + 5];
       if (!W || !H || W > 8192 || H > 8192) return null;
-      const linear = (R[rb + 5] & 0x1000) !== 0;
+      if (g.gl && rtIdx === 0) {
+        const zEn = R[0x54E] & 1, z0 = zEn ? R[0x3F8] : 0, z1 = zEn ? R[0x3F9] : 0, gen = g.sys.mem.gen;
+        const c = this._glTgt;
+        if (c && c.r0 === r0 && c.r1 === r1 && c.W === W && c.H === H && c.r4 === r4 && c.r5 === r5 && c.zEn === zEn && c.z0 === z0 && c.z1 === z1 && c.gen === gen) return c.t;
+      }
+      const addr = r0 * 4294967296 + r1, fmt = r4 & 0xFF, bh = 1 << ((r5 >>> 4) & 15);
+      const linear = (r5 & 0x1000) !== 0;
       const bpp = fmt === 0xE8 || fmt === 0xE9 ? 2 : 4;
       let lay;
       if (linear) {
@@ -23800,8 +24083,11 @@ registerProcessor('ngbsn-out', NgbsnOut);
       if (g.gl && cpuAddr !== null) {
         // con WebGL no hace falta copiar la RAM de destino en cada dibujo (solo si algun shader cae a software)
         // zKey: un solo bufer de profundidad por direccion zeta, compartido por los bufers de color que se alternan
-        const zKey = (R[0x54E] & 1) ? (R[0x3F8] * 4294967296 + R[0x3F9]) + ':' + W + 'x' + H : null;
-        return { addr, cpuAddr, W, H, fmt, bpp, lay, sp: null, depth: null, linear, zKey };
+        const zEn = R[0x54E] & 1;
+        const zKey = zEn ? (R[0x3F8] * 4294967296 + R[0x3F9]) + ':' + W + 'x' + H : null;
+        const t = { addr, cpuAddr, W, H, fmt, bpp, lay, sp: null, depth: null, linear, zKey };
+        if (rtIdx === 0) this._glTgt = { r0, r1, W, H, r4, r5, zEn, z0: zEn ? R[0x3F8] : 0, z1: zEn ? R[0x3F9] : 0, gen: g.sys.mem.gen, t };
+        return t;
       }
       const sp = g.span(addr, lay.size);
       if (!sp) { this.warn('destino sin memoria ' + addr.toString(16)); return null; }
@@ -23834,12 +24120,39 @@ registerProcessor('ngbsn-out', NgbsnOut);
       if (d & 0x3C) {
         const c = [0, 1, 2, 3].map(k => Math.round(Math.min(1, Math.max(0, nxrF(R[0x360 + k]))) * 255));
         const u8 = t.sp.u8, o = t.sp.off, mR = d & 4, mG = d & 8, mB = d & 16, mA = d & 32;
-        for (let y = sy0; y < sy1; y++) {
-          const ro = o + t.lay.row[y];
-          for (let x = sx0; x < sx1; x++) {
-            const a = ro + t.lay.col[x];
-            if (t.fmt === 0xCF) { if (mB) u8[a] = c[2]; if (mG) u8[a + 1] = c[1]; if (mR) u8[a + 2] = c[0]; if (mA) u8[a + 3] = c[3]; }
-            else { if (mR) u8[a] = c[0]; if (mG) u8[a + 1] = c[1]; if (mB) u8[a + 2] = c[2]; if (mA) u8[a + 3] = c[3]; }
+        if (sx0 === 0 && sy0 === 0 && sx1 === t.W && (d & 0x3C) === 0x3C && t.bpp === 4 && t.lay && o + t.lay.size <= u8.length) {
+          const w32 = t.fmt === 0xCF
+            ? ((c[2] | (c[1] << 8) | (c[0] << 16) | (c[3] << 24)) >>> 0)
+            : ((c[0] | (c[1] << 8) | (c[2] << 16) | (c[3] << 24)) >>> 0);
+          const aligned = ((u8.byteOffset + o) & 3) === 0;
+          const u32 = aligned ? new Uint32Array(u8.buffer, u8.byteOffset + o, t.lay.size >>> 2) : null;
+          if (sy1 >= t.H || t.H - sy1 <= 64) {
+            if (w32 === 0) u8.fill(0, o, o + t.lay.size);
+            else if (u32) u32.fill(w32);
+            else {
+              const b0 = w32 & 255, b1 = (w32 >>> 8) & 255, b2 = (w32 >>> 16) & 255, b3 = w32 >>> 24;
+              for (let p = o, end = o + t.lay.size; p < end; p += 4) { u8[p] = b0; u8[p + 1] = b1; u8[p + 2] = b2; u8[p + 3] = b3; }
+            }
+          } else if (u32) {
+            for (let y = sy0; y < sy1; y++) {
+              const ro = t.lay.row[y] >>> 2, col = t.lay.col;
+              for (let x = sx0; x < sx1; x++) u32[ro + (col[x] >>> 2)] = w32;
+            }
+          } else {
+            const b0 = w32 & 255, b1 = (w32 >>> 8) & 255, b2 = (w32 >>> 16) & 255, b3 = w32 >>> 24;
+            for (let y = sy0; y < sy1; y++) {
+              const ro = o + t.lay.row[y], col = t.lay.col;
+              for (let x = sx0; x < sx1; x++) { const a = ro + col[x]; u8[a] = b0; u8[a + 1] = b1; u8[a + 2] = b2; u8[a + 3] = b3; }
+            }
+          }
+        } else {
+          for (let y = sy0; y < sy1; y++) {
+            const ro = o + t.lay.row[y];
+            for (let x = sx0; x < sx1; x++) {
+              const a = ro + t.lay.col[x];
+              if (t.fmt === 0xCF) { if (mB) u8[a] = c[2]; if (mG) u8[a + 1] = c[1]; if (mR) u8[a + 2] = c[0]; if (mA) u8[a + 3] = c[3]; }
+              else { if (mR) u8[a] = c[0]; if (mG) u8[a + 1] = c[1]; if (mB) u8[a + 2] = c[2]; if (mA) u8[a + 3] = c[3]; }
+            }
           }
         }
         if (t.sp.copy) g.sys.mem.write(t.sp.cpuAddr, u8);
@@ -23855,68 +24168,50 @@ registerProcessor('ngbsn-out', NgbsnOut);
       if (!(R[0x850] & 1)) return;
       const vs = this.shader(vsAddr, 'vertices'), fs = this.shader(base + R[0x851], 'pixeles');
       const t = this.target(); if (!t) return;
-      // indices
-      let idx;
+      // indices (reutilizando bufer para evitar asignaciones por dibujo)
+      let idx, n;
       if (g.indexed) {
         const ia = R[0x5F2] * 4294967296 + R[0x5F3], fmt = R[0x5F6] & 3, first = R[0x5F7], cnt = R[0x5F8], sz = 1 << fmt;
+        if (!cnt || cnt > 1e6) return;
         const sp = g.span(ia + first * sz, cnt * sz); if (!sp) return;
-        const dv = sp.dv, vb = R[0x50D] | 0;
-        idx = new Int32Array(cnt);
-        for (let i = 0; i < cnt; i++) idx[i] = (sz === 1 ? sp.u8[sp.off + i] : sz === 2 ? dv.getUint16(sp.off + 2 * i, true) : dv.getUint32(sp.off + 4 * i, true)) + vb;
+        const dv = sp.dv, vb = R[0x50D] | 0, off = sp.off;
+        idx = this._idxBuf; if (!idx || idx.length < cnt) idx = this._idxBuf = new Int32Array(Math.max(cnt, 1024));
+        if (sz === 2) for (let i = 0; i < cnt; i++) idx[i] = dv.getUint16(off + (i << 1), true) + vb;
+        else if (sz === 4) for (let i = 0; i < cnt; i++) idx[i] = dv.getUint32(off + (i << 2), true) + vb;
+        else { const u8 = sp.u8; for (let i = 0; i < cnt; i++) idx[i] = u8[off + i] + vb; }
+        n = cnt;
       } else {
-        const first = R[0x35D], cnt = R[0x35E]; idx = new Int32Array(cnt); for (let i = 0; i < cnt; i++) idx[i] = first + i;
+        const first = R[0x35D], cnt = R[0x35E];
+        if (!cnt || cnt > 1e6) return;
+        idx = this._idxBuf; if (!idx || idx.length < cnt) idx = this._idxBuf = new Int32Array(Math.max(cnt, 1024));
+        for (let i = 0; i < cnt; i++) idx[i] = first + i;
+        n = cnt;
       }
-      if (!idx.length || idx.length > 1e6) return;
-      // vertices: atributos 0..31 (formato 0x458 + i) desde los bufers 0x700 + 4 * b
-      const attrs = [];
+      // vertices: atributos 0..31 (formato 0x458 + i) desde los bufers 0x700 + 4 * b (cacheando g.span por bufer)
+      let attrN = this._attrN, attrCB = this._attrCB;
+      if (!attrN) {
+        attrN = this._attrN = new Uint8Array(64);
+        attrN[1] = 4; attrN[2] = 3; attrN[4] = 2; attrN[0x12] = 1; attrN[3] = 4; attrN[5] = 3; attrN[0x0F] = 2; attrN[0x1B] = 1;
+        attrN[0x0A] = 4; attrN[0x13] = 3; attrN[0x18] = 2; attrN[0x1D] = 1;
+        attrCB = this._attrCB = new Uint8Array(64).fill(1);
+        attrCB[1] = 4; attrCB[2] = 4; attrCB[4] = 4; attrCB[0x12] = 4; attrCB[3] = 2; attrCB[5] = 2; attrCB[0x0F] = 2; attrCB[0x1B] = 2;
+      }
+      const attrs = [], bufSp = this._bufSp || (this._bufSp = new Array(32));
+      bufSp.fill(undefined);
       for (let i = 0; i < 32; i++) {
         const f = R[0x458 + i]; if (!f) continue;
         const buf = f & 31, off = (f >>> 7) & 0x3FFF, size = (f >>> 21) & 63, type = (f >>> 27) & 7, cst = (f >>> 6) & 1;
         const fe = R[0x700 + 4 * buf];
         if (cst || !(fe & 0x1000)) { attrs.push({ i, cst: 1 }); continue; }
-        const start = R[0x701 + 4 * buf] * 4294967296 + R[0x702 + 4 * buf], lim = R[0x7C0 + 2 * buf] * 4294967296 + R[0x7C1 + 2 * buf];
-        const sp = g.span(start, Math.max(1, Math.min(lim - start + 1, 64 << 20)));
-        attrs.push({ i, buf, off, size, type, stride: fe & 0xFFF, sp, start, bgra: f >>> 31 });
-      }
-      const C = this.C, vcb = this.cbViews(0), fcb = this.cbViews(4);
-      const AIN = new Float32Array(128), AINU = new Uint32Array(AIN.buffer);
-      const verts = new Map();
-      const outs = vs.outs;
-      const fetch = vi => {
-        let v = verts.get(vi); if (v) return v;
-        AIN.fill(0);
-        for (const a of attrs) {
-          const o = 32 + 4 * a.i; AIN[o + 3] = 1;
-          if (a.cst || !a.sp) continue;
-          const p = a.sp.off + vi * a.stride + a.off, dv = a.sp.dv;
-          if (p < 0 || p + 16 > a.sp.u8.length) continue;
-          const n = { 1: 4, 2: 3, 4: 2, 0x12: 1, 3: 4, 5: 3, 0x0F: 2, 0x1B: 1, 0x0A: 4, 0x13: 3, 0x18: 2, 0x1D: 1 }[a.size] || 0;
-          const cb = { 1: 4, 2: 4, 4: 4, 0x12: 4, 3: 2, 5: 2, 0x0F: 2, 0x1B: 2 }[a.size] || 1;
-          for (let k = 0; k < n; k++) {
-            const q = p + k * cb;
-            let x;
-            if (a.type === 7) {
-              if (cb === 4) x = dv.getFloat32(q, true);
-              else if (cb === 2) {
-                const h = dv.getUint16(q, true), s = (h & 0x8000) ? -1 : 1, e = (h >>> 10) & 31, m = h & 1023;
-                x = e === 0 ? s * Math.pow(2, -14) * (m / 1024) : e === 31 ? (m ? NaN : s * Infinity) : s * Math.pow(2, e - 15) * (1 + m / 1024);
-              } else x = 0;
-            }
-            else if (cb === 1) x = a.type === 1 ? Math.max(-1, dv.getInt8(q) / 127) : a.type === 2 ? a.sp.u8[q] / 255 : a.type === 3 || a.type === 6 ? dv.getInt8(q) : a.sp.u8[q];
-            else if (cb === 2) x = a.type === 1 ? Math.max(-1, dv.getInt16(q, true) / 32767) : a.type === 2 ? dv.getUint16(q, true) / 65535 : a.type === 3 || a.type === 6 ? dv.getInt16(q, true) : dv.getUint16(q, true);
-            else x = a.type === 3 ? dv.getInt32(q, true) : dv.getUint32(q, true);
-            if ((a.type === 3 || a.type === 4) && cb !== 4) AINU[o + k] = x >>> 0; else if (a.type === 3 || a.type === 4) AINU[o + k] = x >>> 0; else AIN[o + k] = x;
-          }
-          if (a.bgra) { const tmp = AIN[o]; AIN[o] = AIN[o + 2]; AIN[o + 2] = tmp; }
+        let binfo = bufSp[buf];
+        if (binfo === undefined) {
+          const start = R[0x701 + 4 * buf] * 4294967296 + R[0x702 + 4 * buf], lim = R[0x7C0 + 2 * buf] * 4294967296 + R[0x7C1 + 2 * buf];
+          binfo = bufSp[buf] = { start, sp: g.span(start, Math.max(1, Math.min(lim - start + 1, 64 << 20))) };
         }
-        const OUT = new Float32Array(128); OUT[31] = 1;
-        C.AF = AIN; C.AU = AINU; C.OU = new Uint32Array(OUT.buffer); C.CF = vcb.CF; C.CU = vcb.CU; C.kill = 0;
-        C.vid = vi; C.iid = g.instanceId || 0; C.r32 = a => g.r32(a); C.w32 = (a, v) => g.w32(a, v);
-        vs.fn(C);
-        verts.set(vi, OUT); return OUT;
-      };
-      // primitivas -> triangulos
-      const tris = [], n = idx.length;
+        attrs.push({ i, buf, off, size, type, stride: fe & 0xFFF, sp: binfo.sp, start: binfo.start, bgra: f >>> 31, n: attrN[size], cb: attrCB[size] });
+      }
+      // primitivas -> triangulos (reutilizando array)
+      const tris = this._tris || (this._tris = []); tris.length = 0;
       if (prim === 4) for (let i = 0; i + 2 < n; i += 3) tris.push(idx[i], idx[i + 1], idx[i + 2]);
       else if (prim === 5) for (let i = 0; i + 2 < n; i++) { if (i & 1) tris.push(idx[i + 1], idx[i], idx[i + 2]); else tris.push(idx[i], idx[i + 1], idx[i + 2]); }
       else if (prim === 6 || prim === 9) for (let i = 1; i + 1 < n; i++) tris.push(idx[0], idx[i], idx[i + 1]);
@@ -23924,27 +24219,82 @@ registerProcessor('ngbsn-out', NgbsnOut);
       else if (prim === 8) for (let i = 0; i + 3 < n; i += 2) tris.push(idx[i], idx[i + 1], idx[i + 3], idx[i], idx[i + 3], idx[i + 2]);
       else { this.warn('primitiva ' + prim + ' sin hacer'); return; }
       // estado de pixel
-      const vp = [nxrF(R[0x280]), nxrF(R[0x281]), nxrF(R[0x282]), nxrF(R[0x283]), nxrF(R[0x284]), nxrF(R[0x285])];
+      const vp = this._vp || (this._vp = [0, 0, 0, 0, 0, 0]);
+      vp[0] = nxrF(R[0x280]); vp[1] = nxrF(R[0x281]); vp[2] = nxrF(R[0x282]); vp[3] = nxrF(R[0x283]); vp[4] = nxrF(R[0x284]); vp[5] = nxrF(R[0x285]);
       // mezcla por destino (0x780 + 8 * rt): solo con BLEND_INDEPENDENT (0x4B9) y si esos registros tienen algo. Antes se
       // miraba 0x4CF, que Mesa pone a 1 siempre: con 0x780+ a cero las pasadas con mezcla (luz, consola) salian negras
       const perRtBlend = ((R[0x4B9] & 1) && (R[0x781] || R[0x782] || R[0x783])) || ((R[0x781] || R[0x782] || R[0x783]) && !(R[0x4D1] || R[0x4D2]));
       const sepA = perRtBlend ? (R[0x780] & 1) : 1;
-      const st = {
-        zTest: (R[0x4B3] & 1) && t.depth, zWrite: (R[0x4BA] & 1) && t.depth, zFunc: R[0x4C3],
-        blend: R[0x4D8] & 1,
-        eqC: perRtBlend ? R[0x781] : R[0x4D0], sC: perRtBlend ? R[0x782] : R[0x4D1], dC: perRtBlend ? R[0x783] : R[0x4D2],
-        eqA: perRtBlend ? (sepA ? R[0x784] : R[0x781]) : R[0x4D3],
-        sA: perRtBlend ? (sepA ? R[0x785] : R[0x782]) : R[0x4D4],
-        dA: perRtBlend ? (sepA ? R[0x786] : R[0x783]) : R[0x4D6],
-        mask: R[0x680] & 0x1111,
-        cull: (R[0x646] & 1) ? (R[0x648] || 0x405) : 0,          // CULL_FACE (0x1920); antes se leia FRONT_FACE y no se quitaba nada
-        frontCcw: (R[0x647] || 0x901) === 0x901,                 // FRONT_FACE (0x191C)
-        sx0: 0, sx1: t.W, sy0: 0, sy1: t.H
-      };
+      const st = this._st || (this._st = {});
+      st.zTest = (R[0x4B3] & 1) && t.depth; st.zWrite = (R[0x4BA] & 1) && t.depth; st.zFunc = R[0x4C3];
+      st.blend = R[0x4D8] & 1;
+      st.eqC = perRtBlend ? R[0x781] : R[0x4D0]; st.sC = perRtBlend ? R[0x782] : R[0x4D1]; st.dC = perRtBlend ? R[0x783] : R[0x4D2];
+      st.eqA = perRtBlend ? (sepA ? R[0x784] : R[0x781]) : R[0x4D3];
+      st.sA = perRtBlend ? (sepA ? R[0x785] : R[0x782]) : R[0x4D4];
+      st.dA = perRtBlend ? (sepA ? R[0x786] : R[0x783]) : R[0x4D6];
+      st.mask = R[0x680] & 0x1111;
+      st.cull = (R[0x646] & 1) ? (R[0x648] || 0x405) : 0;          // CULL_FACE (0x1920); antes se leia FRONT_FACE y no se quitaba nada
+      st.frontCcw = (R[0x647] || 0x901) === 0x901;                 // FRONT_FACE (0x191C)
+      if (R[0x380] & 1) { st.sx0 = Math.max(0, R[0x381] & 0xFFFF); st.sx1 = Math.min(t.W, R[0x381] >>> 16); st.sy0 = Math.max(0, R[0x382] & 0xFFFF); st.sy1 = Math.min(t.H, R[0x382] >>> 16); }
+      else { st.sx0 = 0; st.sx1 = t.W; st.sy0 = 0; st.sy1 = t.H; }
       st.cS = nxrBlendCode(st.sC); st.cD = nxrBlendCode(st.dC); st.aS = nxrBlendCode(st.sA); st.aD = nxrBlendCode(st.dA);
       st.alphaBlend = st.cS === 0x302 && st.cD === 0x303 && st.aS === 0x302 && st.aD === 0x303 && (st.eqC & 0xFFFF) === 0x8006 && (st.eqA & 0xFFFF) === 0x8006;
-      if (R[0x380] & 1) { st.sx0 = Math.max(0, R[0x381] & 0xFFFF); st.sx1 = Math.min(t.W, R[0x381] >>> 16); st.sy0 = Math.max(0, R[0x382] & 0xFFFF); st.sy1 = Math.min(t.H, R[0x382] >>> 16); }
-      const texCb = R[0x982] & 31, texCache = new Map(), self = this;
+      const vcb = this.cbViews(0), fcb = this.cbViews(4), texCb = R[0x982] & 31;
+      // ruta acelerada WebGL2 100% GPU (VS + FS en GLSL nativo: sin ejecutar vs.fn por vertice en JS)
+      if (g.gl && t.cpuAddr !== null && vs.glMeta && vs.glMeta.glslVs && fs.glMeta && fs.glMeta.glslFs) {
+        const getTex = slot => { const h = fcb.CU[texCb] ? fcb.CU[texCb][slot] : 0; return this.texture(h); };
+        if (g.gl.drawFullGL(t, st, vp, tris, attrs, vs.glMeta.glslVs, fs.glMeta.glslFs, getTex, vcb, fcb, this)) return;
+      }
+      const C = this.C;
+      let AIN = this._ain, AINU = this._ainu;
+      if (!AIN) { AIN = this._ain = new Float32Array(128); AINU = this._ainu = new Uint32Array(AIN.buffer); }
+      const vpool = this._vpool || (this._vpool = []);
+      let vpoolIdx = 0;
+      const verts = new Map();
+      const outs = vs.outs;
+      C.AF = AIN; C.AU = AINU; C.CF = vcb.CF; C.CU = vcb.CU; C.iid = g.instanceId || 0;
+      C.r32 = this._r32 || (this._r32 = a => g.r32(a));
+      C.w32 = this._w32 || (this._w32 = (a, v) => g.w32(a, v));
+      const nAttrs = attrs.length;
+      const fetch = vi => {
+        let v = verts.get(vi); if (v) return v;
+        AIN.fill(0);
+        for (let ai = 0; ai < nAttrs; ai++) {
+          const a = attrs[ai], o = 32 + (a.i << 2); AIN[o + 3] = 1;
+          if (a.cst || !a.sp) continue;
+          const p = a.sp.off + vi * a.stride + a.off, dv = a.sp.dv;
+          if (p < 0 || p + 16 > a.sp.u8.length) continue;
+          const an = a.n, cb = a.cb, tp = a.type;
+          for (let k = 0; k < an; k++) {
+            const q = p + k * cb;
+            let x;
+            if (tp === 7) {
+              if (cb === 4) x = dv.getFloat32(q, true);
+              else if (cb === 2) {
+                const h = dv.getUint16(q, true), s = (h & 0x8000) ? -1 : 1, e = (h >>> 10) & 31, m = h & 1023;
+                x = e === 0 ? s * Math.pow(2, -14) * (m / 1024) : e === 31 ? (m ? NaN : s * Infinity) : s * Math.pow(2, e - 15) * (1 + m / 1024);
+              } else x = 0;
+            }
+            else if (cb === 1) x = tp === 1 ? Math.max(-1, dv.getInt8(q) / 127) : tp === 2 ? a.sp.u8[q] / 255 : tp === 3 || tp === 6 ? dv.getInt8(q) : a.sp.u8[q];
+            else if (cb === 2) x = tp === 1 ? Math.max(-1, dv.getInt16(q, true) / 32767) : tp === 2 ? dv.getUint16(q, true) / 65535 : tp === 3 || tp === 6 ? dv.getInt16(q, true) : dv.getUint16(q, true);
+            else x = tp === 3 ? dv.getInt32(q, true) : dv.getUint32(q, true);
+            if (tp === 3 || tp === 4) AINU[o + k] = x >>> 0; else AIN[o + k] = x;
+          }
+          if (a.bgra) { const tmp = AIN[o]; AIN[o] = AIN[o + 2]; AIN[o + 2] = tmp; }
+        }
+        let slot = vpool[vpoolIdx++];
+        if (!slot) { const f = new Float32Array(128); slot = vpool[vpoolIdx - 1] = { f, u: new Uint32Array(f.buffer) }; }
+        const OUT = slot.f; OUT.fill(0); OUT[31] = 1;
+        C.OU = slot.u; C.kill = 0; C.vid = vi;
+        vs.fn(C);
+        verts.set(vi, OUT); return OUT;
+      };
+      // ruta acelerada WebGL2 (con traductor nativo SASS->GLSL para FS o shaders rapidos color/textura)
+      if (g.gl && t.cpuAddr !== null && fs.glMeta && fs.glMeta.canGL) {
+        const getTex = slot => { const h = fcb.CU[texCb] ? fcb.CU[texCb][slot] : 0; return this.texture(h); };
+        if (g.gl.draw(t, st, vp, tris, fetch, fs.glMeta, getTex, fcb, this)) return;
+      }
+      const texCache = new Map(), self = this;
       const bySlot = [], lodSt = [];
       C.txq = (slot, out) => {
         let tx = bySlot[slot];
@@ -23987,16 +24337,6 @@ registerProcessor('ngbsn-out', NgbsnOut);
         }
         self.sample(tx, u, v, out, lod);
       };
-      // ruta acelerada WebGL2 100% GPU (VS + FS en GLSL nativo: sin ejecutar vs.fn por vertice en JS)
-      if (g.gl && t.cpuAddr !== null && vs.glMeta && vs.glMeta.glslVs && fs.glMeta && fs.glMeta.glslFs) {
-        const getTex = slot => { const h = fcb.CU[texCb] ? fcb.CU[texCb][slot] : 0; return this.texture(h); };
-        if (g.gl.drawFullGL(t, st, vp, tris, attrs, vs.glMeta.glslVs, fs.glMeta.glslFs, getTex, vcb, fcb, this)) return;
-      }
-      // ruta acelerada WebGL2 (con traductor nativo SASS->GLSL para FS o shaders rapidos color/textura)
-      if (g.gl && t.cpuAddr !== null && fs.glMeta && fs.glMeta.canGL) {
-        const getTex = slot => { const h = fcb.CU[texCb] ? fcb.CU[texCb][slot] : 0; return this.texture(h); };
-        if (g.gl.draw(t, st, vp, tris, fetch, fs.glMeta, getTex, fcb, this)) return;
-      }
       // recorte contra w > 0 y raster (software)
       // un dibujo que WebGL no sabe hacer (shaders sin traducir, como los de Quake): se baja a memoria lo que WebGL ya
       // habia pintado y la consola sigue entera por software. Mezclar las dos rutas por dibujo no sirve (cada una tiene su
@@ -24211,6 +24551,7 @@ registerProcessor('ngbsn-out', NgbsnOut);
         e = {
           prog,
           uCB: gl.getUniformLocation(prog, 'uCB'),
+          uLdc: gl.getUniformLocation(prog, 'uLdc'),
           uTex: [0, 1, 2, 3].map(i => gl.getUniformLocation(prog, 'uTex' + i))
         };
       } catch (err) {
@@ -24313,8 +24654,9 @@ registerProcessor('ngbsn-out', NgbsnOut);
         for (const bk of glslVs.cbBanks) { const src = vcb.CF[bk]; if (src) this.vcbTmp.set(src.subarray(0, Math.min(64, src.length)), bk * 64); }
         gl.uniform4fv(vf.uVCB, this.vcbTmp);
       }
-      if (vf.uCB && glslFs.cbBanks.length && fcb && fcb.CF) {
-        for (const bk of glslFs.cbBanks) { const src = fcb.CF[bk]; if (src) this.cbTmp.set(src.subarray(0, Math.min(64, src.length)), bk * 64); }
+      if (vf.uCB && glslFs.cbList && glslFs.cbList.length && fcb && fcb.CF) {
+        const L = glslFs.cbList;
+        for (let k = 0; k < L.length; k++) { const src = fcb.CF[L[k][0]]; this.cbTmp[k] = src ? (src[L[k][1]] || 0) : 0; }
         gl.uniform4fv(vf.uCB, this.cbTmp);
       }
       for (let u = 0; u < glslFs.texSlots.length; u++) {
@@ -24536,12 +24878,16 @@ registerProcessor('ngbsn-out', NgbsnOut);
       gl.colorMask(!!(m & 1), !!(m & 0x10), !!(m & 0x100), !!(m & 0x1000));
       if (glslProg) {
         if (this._curProg !== glslProg.prog) { gl.useProgram(glslProg.prog); this._curProg = glslProg.prog; }
-        if (glslProg.uCB && meta.glslFs.cbBanks.length && fcb && fcb.CF) {
-          for (const bk of meta.glslFs.cbBanks) {
-            const src = fcb.CF[bk];
-            if (src) this.cbTmp.set(src.subarray(0, Math.min(64, src.length)), bk * 64);
-          }
+        if (glslProg.uCB && meta.glslFs.cbList && meta.glslFs.cbList.length && fcb && fcb.CF) {
+          const L = meta.glslFs.cbList;
+          for (let k = 0; k < L.length; k++) { const src = fcb.CF[L[k][0]]; this.cbTmp[k] = src ? (src[L[k][1]] || 0) : 0; }
           gl.uniform4fv(glslProg.uCB, this.cbTmp);
+        }
+        if (glslProg.uLdc && meta.glslFs.ldcBank >= 0 && fcb && fcb.CF) {
+          const src = fcb.CF[meta.glslFs.ldcBank];
+          if (!this.ldcTmp) this.ldcTmp = new Float32Array(128);
+          if (src) this.ldcTmp.set(src.subarray(0, Math.min(128, src.length)), 0);
+          gl.uniform4fv(glslProg.uLdc, this.ldcTmp);
         }
         const slots = meta.glslFs.texSlots;
         for (let u = 0; u < slots.length; u++) {
@@ -25681,13 +26027,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
       }
     }
-    // direccion de la GPU -> direccion del programa (por las asignaciones de nvhost-as-gpu)
+    // direccion de la GPU -> direccion del programa (por las asignaciones de nvhost-as-gpu, con cache MRU de 2 entradas)
     gpuToCpu (gva) {
-      if (!this.sys.nvGpuMap) return null;
-      for (const [vAddr, info] of this.sys.nvGpuMap) {
-        if (gva >= vAddr && gva < vAddr + (info.size || 0x10000)) {
-          const map = this.sys.nvmap && this.sys.nvmap.get(info.h);
-          if (map && map.addr) return map.addr + (info.off || 0) + (gva - vAddr);
+      const m1 = this._gva1;
+      if (m1 && gva >= m1.gva && gva < m1.end) return m1.cpu + (gva - m1.gva);
+      const m2 = this._gva2;
+      if (m2 && gva >= m2.gva && gva < m2.end) { this._gva2 = m1; this._gva1 = m2; return m2.cpu + (gva - m2.gva); }
+      const mp = this.sys.nvGpuMap;
+      if (!mp) return null;
+      const nvmap = this.sys.nvmap;
+      for (const [vAddr, info] of mp) {
+        const end = vAddr + (info.size || 0x10000);
+        if (gva >= vAddr && gva < end) {
+          const map = nvmap && nvmap.get(info.h);
+          if (map && map.addr) {
+            const cpu = map.addr + (info.off || 0);
+            this._gva2 = m1; this._gva1 = { gva: vAddr, end, cpu };
+            return cpu + (gva - vAddr);
+          }
         }
       }
       return null;
@@ -25696,9 +26053,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // (p. ej. Vulkan divide cabecera LOAD_INLINE_DATA 0x6D y los datos del shader en dos entradas GPFIFO consecutivas)
     execPushbuffer (cpuAddr, wordCount) {
       const mem = this.sys.mem;
+      if (!this.gpu && typeof NxGpu !== 'undefined') {
+        this.gpu = new NxGpu(this);
+        if (this.sys && this.sys._pendingGL) this.gpu.useGL(this.sys._pendingGL);
+      }
+      let u32 = null, baseIdx = 0;
+      if ((cpuAddr & 3) === 0 && mem.find) {
+        const rg = mem.find(cpuAddr);
+        if (rg) {
+          if (rg.sparse) {
+            const off = cpuAddr - rg.base, co = off & rg.chunkMask;
+            if (co + wordCount * 4 <= rg.chunkSize) {
+              const c = mem._spChunk(rg, off, false);
+              if (c && c.u32) { u32 = c.u32; baseIdx = co >>> 2; }
+            }
+          } else if (rg.u32 && cpuAddr + wordCount * 4 <= rg.end) {
+            u32 = rg.u32; baseIdx = (cpuAddr - rg.base) >>> 2;
+          }
+        }
+      }
+      const gpu = this.gpu, subs = this.subchannels;
       let i = 0;
       while (this.pbRem > 0 && i < wordCount) {
-        const d = mem.r32(cpuAddr + i * 4) >>> 0; i++;
+        const d = (u32 ? u32[baseIdx + i] : mem.r32(cpuAddr + i * 4)) >>> 0; i++;
         const m = this.pbMethod;
         if (this.pbOp === 1 || this.pbOp === 0) this.pbMethod = (m + 1) & 0x1FFF;
         else if (this.pbOp === 5) { this.pbMethod = (m + 1) & 0x1FFF; this.pbOp = 3; }
@@ -25706,20 +26083,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         this.handleMethod(this.pbSub, m, d);
       }
       while (i < wordCount) {
-        const tok = mem.r32(cpuAddr + i * 4) >>> 0; i++;
+        const tok = (u32 ? u32[baseIdx + i] : mem.r32(cpuAddr + i * 4)) >>> 0; i++;
         const op = tok >>> 29, method = tok & 0x1FFF, sub = (tok >>> 13) & 7, count = (tok >>> 16) & 0x1FFF;
         if (op === 1 || op === 5 || op === 3) {
           let m = method, curOp = op, rem = count;
+          const cls = subs[sub] >>> 0;
+          const fast3d = gpu && (cls === 0xB197 || cls === 0xB097 || cls === 0xA097);
           while (rem > 0 && i < wordCount) {
-            const d = mem.r32(cpuAddr + i * 4) >>> 0; i++; rem--;
+            const d = (u32 ? u32[baseIdx + i] : mem.r32(cpuAddr + i * 4)) >>> 0; i++; rem--;
             const useM = m;
             if (curOp === 1) m = (m + 1) & 0x1FFF;
             else if (curOp === 5) { m = (m + 1) & 0x1FFF; curOp = 3; }
-            this.handleMethod(sub, useM, d);
+            if (fast3d && useM > 7 && (useM < 0x6C0 || useM > 0x6C3)) {
+              if (useM >= 0xE00) {
+                if (!(useM & 1)) { if (gpu.pend) gpu.flush(); gpu.pend = { id: (useM - 0xE00) >> 1, params: [d], sub }; }
+                else if (gpu.pend) gpu.pend.params.push(d);
+              } else {
+                if (gpu.pend) gpu.flush();
+                gpu.m3d(useM, d);
+              }
+            } else {
+              this.handleMethod(sub, useM, d);
+            }
           }
           if (rem > 0) { this.pbRem = rem; this.pbOp = curOp; this.pbSub = sub; this.pbMethod = m; return; }
         } else if (op === 4) {
-          this.handleMethod(sub, method, count);
+          if (gpu && method > 7 && (method < 0x6C0 || method > 0x6C3)) {
+            const cls = subs[sub] >>> 0;
+            if (cls === 0xB197 || cls === 0xB097 || cls === 0xA097) {
+              if (method >= 0xE00) {
+                if (!(method & 1)) { if (gpu.pend) gpu.flush(); gpu.pend = { id: (method - 0xE00) >> 1, params: [count], sub }; }
+                else if (gpu.pend) gpu.pend.params.push(count);
+              } else {
+                if (gpu.pend) gpu.flush();
+                gpu.m3d(method, count);
+              }
+            } else {
+              gpu.method(sub, cls, method, count);
+            }
+          } else {
+            this.handleMethod(sub, method, count);
+          }
         } else if (op === 7) {
           break;
         }
@@ -25736,24 +26140,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (this.sys && this.sys._pendingGL) this.gpu.useGL(this.sys._pendingGL);
       }
       if (this.gpu) this.gpu.method(subchannel, this.subchannels[subchannel] >>> 0, method, data >>> 0);
-      const S = this.sem || (this.sem = { a: 0, b: 0, c: 0, ra: 0, rb: 0, rc: 0 });
-      // semaforo del canal (SEMAPHORE_A..D, metodos 0x04-0x07): al soltarlo la GPU escribe el valor en memoria. Mesa /
-      // libnx esperan ese valor (Quake se quedaba para siempre esperando su valla)
-      if (method === 0x04) { S.a = data & 0xFF; return; }
-      if (method === 0x05) { S.b = data >>> 0; return; }
-      if (method === 0x06) { S.c = data >>> 0; return; }
-      if (method === 0x07) {
-        if ((data & 7) === 2) this.semRelease(S.a * NX_TWO32 + S.b, S.c, !((data >>> 24) & 1));   // RELEASE (bit 24: 4 bytes)
-        return;
-      }
-      // semaforo de informes del motor 3D (SET_REPORT_SEMAPHORE_A..D = QUERY_ADDRESS_HIGH.. en Mesa: bytes 0x1B00-0x1B0C,
-      // metodos 0x6C0-0x6C3): Mesa (nvc0) escribe asi la secuencia de su valla
-      if (method === 0x6C0) { S.ra = data & 0xFF; return; }
-      if (method === 0x6C1) { S.rb = data >>> 0; return; }
-      if (method === 0x6C2) { S.rc = data >>> 0; return; }
-      if (method === 0x6C3) {
-        if ((data & 3) === 0) this.semRelease(S.ra * NX_TWO32 + S.rb, S.rc, !((data >>> 28) & 1));   // RELEASE (bit 28: una palabra)
-        return;
+      if (method <= 7 || (method >= 0x6C0 && method <= 0x6C3)) {
+        const S = this.sem || (this.sem = { a: 0, b: 0, c: 0, ra: 0, rb: 0, rc: 0 });
+        // semaforo del canal (SEMAPHORE_A..D, metodos 0x04-0x07): al soltarlo la GPU escribe el valor en memoria. Mesa /
+        // libnx esperan ese valor (Quake se quedaba para siempre esperando su valla)
+        if (method === 0x04) { S.a = data & 0xFF; return; }
+        if (method === 0x05) { S.b = data >>> 0; return; }
+        if (method === 0x06) { S.c = data >>> 0; return; }
+        if (method === 0x07) {
+          if ((data & 7) === 2) this.semRelease(S.a * NX_TWO32 + S.b, S.c, !((data >>> 24) & 1));   // RELEASE (bit 24: 4 bytes)
+          return;
+        }
+        // semaforo de informes del motor 3D (SET_REPORT_SEMAPHORE_A..D = QUERY_ADDRESS_HIGH.. en Mesa: bytes 0x1B00-0x1B0C,
+        // metodos 0x6C0-0x6C3): Mesa (nvc0) escribe asi la secuencia de su valla
+        if (method === 0x6C0) { S.ra = data & 0xFF; return; }
+        if (method === 0x6C1) { S.rb = data >>> 0; return; }
+        if (method === 0x6C2) { S.rc = data >>> 0; return; }
+        if (method === 0x6C3) {
+          if ((data & 3) === 0) this.semRelease(S.ra * NX_TWO32 + S.rb, S.rc, !((data >>> 28) & 1));   // RELEASE (bit 28: una palabra)
+          return;
+        }
       }
       if (method === 0x0040) return; // WAIT_FOR_IDLE
       if (method === 0x08E0) return; // CLEAR_BUFFERS
@@ -25841,8 +26247,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
           }
           dv.setBigUint64(32, BigInt(gva), true);
           sys.nvGpuMap = sys.nvGpuMap || new Map(); sys.nvGpuMap.set(gva, { h, flags, gva, size, off: bufOff });
+          this._gva1 = null; this._gva2 = null;
         } else if (nr === 5) {                                 // UNMAP_BUFFER
           const gva = Number(dv.getBigUint64(0, true)); if (sys.nvGpuMap) sys.nvGpuMap.delete(gva);
+          this._gva1 = null; this._gva2 = null;
         } else if (nr === 3) {                                 // FREE_SPACE (NVN)
           // liberacion de espacio VA
         } else if (nr === 1) {                                 // BIND_CHANNEL (0x40044101)
@@ -25867,6 +26275,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (!rH || !pages) sys.nvGpuMap.delete(gva);
             else sys.nvGpuMap.set(gva, { h: rH, flags: rFlags, gva, size: pages * pageSz, off: memOffPages * pageSz });
           }
+          this._gva1 = null; this._gva2 = null;
         } else this.warn(path, rq);
       } else if (path === '/dev/nvhost-ctrl-gpu') {
         if (nr === 5) {                                        // GET_CHARACTERISTICS (0xC0B04705)
@@ -26168,15 +26577,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     get cmds () {
       const sys = this.sys;
       const makeRomStorage = () => {
-        if (sys.romfsStream && typeof FileReaderSync !== 'undefined') {
-          const S = sys.romfsStream, frs = new FileReaderSync();
+        if (sys.romfsStream && (typeof FileReaderSync !== 'undefined' || (sys.romfsStream.file && sys.romfsStream.file.url))) {
+          const S = sys.romfsStream, frs = S.file && S.file.url ? null : new FileReaderSync();
+          // archivo servido por URL (pruebas, o un .nsp enorme por HTTP con Range): lecturas sincronas, como el disco de la GameCube
+          const readRange = (a, b) => {
+            if (frs) return frs.readAsArrayBuffer(S.file.slice(a, b));
+            for (let k = 0; ; k++) {                        // la red local puede fallar un momento: hasta 4 intentos
+              try {
+                const x = new XMLHttpRequest(); x.open('GET', S.file.url, false); x.responseType = 'arraybuffer'; x.setRequestHeader('Range', 'bytes=' + a + '-' + (b - 1)); x.send(null);
+                if (x.status === 206 || x.status === 200) return x.response;
+                throw new Error('HTTP ' + x.status);
+              } catch (e) { if (k >= 3) throw e; }
+            }
+          };
           return {
             name: 'IStorage',
             cmds: {
               0: c => {
                 const off = Number(c.u64(0)), n = Math.min(Number(c.u64(8)), Math.max(0, S.size - off));
                 if (n <= 0) return;
-                const raw = new Uint8Array(frs.readAsArrayBuffer(S.file.slice(S.fileOff + off, S.fileOff + off + n)));
+                const raw = new Uint8Array(readRange(S.fileOff + off, S.fileOff + off + n));
                 const dec = (S.cryptType === 3 && typeof NxAes128 !== 'undefined') ? NxAes128.ctrCrypt(S.secKey, S.iv8, raw, S.ncaOff + off, S._aes || (S._aes = new NxAes128(S.secKey))) : raw;
                 c.writeBuf(0, dec);
               },
@@ -26416,7 +26836,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     for (const k of sys.cpu.jit.blocks.keys()) if (k >= genStart && k < genEnd) sys.cpu.jit.blocks.delete(k);
                   }
                 }
-                m.codeGen++;
                 c.w32(m.r32(ioBase + 0x80) | 0); c.w32(0);
                 c.w64(r64m(ioBase + 0x90)); c.w64(r64m(ioBase + 0x98));
                 c.w64(r64m(ioBase + 0xA0)); c.w64(r64m(ioBase + 0xA8));
@@ -26970,23 +27389,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (sys.viState) sys.viState.vsync.signal();
       if (sys.audrenEvts) for (const ev of sys.audrenEvts) ev.signal();
       const n0 = sys.screen ? sys.screen.n : 0;
-      if (sys.cpu && sys.cpu.jit) sys.cpu.jit.compileBudget = (this.frames > 2 && ms <= 40) ? 20 : 1e9;
+      if (sys.cpu && sys.cpu.jit) sys.cpu.jit.compileBudget = (this.frames > 2 && ms <= 40) ? (this.frames < 60 ? 120 : 40) : 1e9;
       const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
       const hack60 = typeof globalThis !== 'undefined' && !!globalThis.NGBSN_HACK60;
       const hz = hack60 ? 60 : (targetHz === 30 ? 30 : 60);
       // En modo 60 FPS Overclock: 2.04 GHz virtuales (2x reloj base Switch) + doble pulso VSync para desbloquear juegos de 30 FPS
       const per = Math.max(50000, Math.floor((hack60 ? Math.max(this.ips, 2040000000) : this.ips) / hz));
       const msLim = hack60 ? Math.max(ms, 16) : ms;
+      const postPresentMs = Math.min(msLim * 0.25, 3.0);
       let done = 0, midPulse = false;
       while (done < per && !sys.exited) {
         const presented = (sys.screen ? sys.screen.n : 0) !== n0;
-        const slice = Math.min(presented ? 80000 : 120000, per - done);
+        const slice = Math.min(presented ? 40000 : 120000, per - done);
         sys.run(slice);
         done += slice;
         if ((sys.screen ? sys.screen.n : 0) !== n0) {
           const bgReady = sys.threads && sys.threads.some(th => th.state === 'ready');
           const nowP = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-          if (!bgReady || nowP - t0 >= msLim * 0.55) break;
+          if (!bgReady || nowP - t0 >= postPresentMs) break;
         }
         if (hack60 && !midPulse && done >= (per >>> 1) && sys.viState) {
           midPulse = true;
@@ -27995,6 +28415,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     const pool = [], rs = { L: [0, 0, 0], R: [0, 0, 0], ph: 0 };
     const now = () => performance.now();
     const post = (msg, tr) => self.postMessage(msg, tr || []);
+    let glLost = 0;                                     // veces que se ha perdido el contexto WebGL
     const mc = new MessageChannel(); mc.port1.onmessage = () => tick();
     const kick = () => mc.port2.postMessage(0);
 
@@ -28042,7 +28463,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (s.bmp) {
         const bmp = s.bmp; s.bmp = null;
         shown = s.n; fbW = s.w; fbH = s.h;
-        post({ t: 'frame', w: s.w, h: s.h, bmp, frames: m.frames, fps, hz: targetHz, gl: !!m.gx.glb, mips, busy, pauses }, [bmp]);
+        post({ t: 'frame', w: s.w, h: s.h, bmp, frames: m.frames, fps, hz: targetHz, gl: !!m.gx.glb, mips, busy, pauses, glLost }, [bmp]);
         return;
       }
       if (inflight >= 2 && !pool.length) return;
@@ -28053,7 +28474,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (!buf) buf = new ArrayBuffer(bytes);
       new Uint32Array(buf).set(s.px);
       fbW = s.w; fbH = s.h; inflight++;
-      post({ t: 'frame', w: s.w, h: s.h, buf, frames: m.frames, fps, hz: targetHz, gl: !!m.gx.glb, mips, busy, pauses }, [buf]);
+      post({ t: 'frame', w: s.w, h: s.h, buf, frames: m.frames, fps, hz: targetHz, gl: !!m.gx.glb, mips, busy, pauses, glLost }, [buf]);
     }
 
     function saveCard (force) {
@@ -28086,24 +28507,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // En juegos 3D pesados (30 FPS, como en Switch real), damos 32.5 ms de presupuesto por fotograma para evitar cortes a medias
         m.frame(targetHz === 30 ? 32.5 : 15.5, targetHz);
       } catch (e) {
+        // el navegador ha reiniciado la GPU (contexto WebGL perdido): la primera vez un contexto nuevo, despues por
+        // software; la consola sigue (antes se paraba con "WebGL context is lost")
+        if (gl && typeof gl.isContextLost === 'function' && gl.isContextLost()) {
+          glLost++;
+          try { m.gx.useGL(null); } catch (e2) { /* nada */ }
+          gl = null;
+          if (glLost === 1) { try { setGL(true); } catch (e2) { /* nada */ } }
+          next = now();
+          kick(); return;
+        }
         running = false;
-        post({ t: 'err', msg: 'La Switch se ha parado: ' + (e && e.message || e) });
+        post({ t: 'err', msg: 'La Switch se ha parado: ' + (e && e.message || e) + (glLost ? ' (contexto WebGL perdido ' + glLost + ' veces)' : '') + (m.sys && m.sys.log ? ' | ' + m.sys.log.slice(-6).join(' | ').slice(0, 600) : '') });
         return;
       }
       const dtF = now() - f0;
       stBusy += dtF;
       if (!hack60) {
-        if (targetHz === 60 && dtF > 14.5) {
-          if (++heavyRun >= 6) { targetHz = 30; heavyRun = 0; lightRun = 0; }
-        } else if (targetHz === 30 && dtF < 11) {
-          if (++lightRun >= 45) { targetHz = 60; lightRun = 0; heavyRun = 0; }
+        if (targetHz === 60 && m.frames > 30 && dtF > 22) {
+          if (++heavyRun >= 24) { targetHz = 30; heavyRun = 0; lightRun = 0; }
+        } else if (targetHz === 30 && dtF < 15.5) {
+          if (++lightRun >= 10) { targetHz = 60; lightRun = 0; heavyRun = 0; }
         } else {
           if (targetHz === 60) heavyRun = 0; else lightRun = 0;
         }
       }
       if (m.err) {
         running = false;
-        post({ t: 'err', msg: m.err });
+        post({ t: 'err', msg: m.err + (glLost ? ' (contexto WebGL perdido ' + glLost + ' veces)' : ''), log: m.sys && m.sys.log ? m.sys.log.slice(-12) : null });
         return;
       }
       next += 1000 / targetHz;
@@ -28256,7 +28687,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         this.img = d;
         this.frames = d.frames;
         this.fps = d.fps;
-        this.mips = d.mips; this.busy = d.busy; this.pauses = d.pauses;
+        this.mips = d.mips; this.busy = d.busy; this.pauses = d.pauses; this.glLost = d.glLost || 0;
         if (d.hz) this.hz = d.hz;
         this.gx.glb = !!d.gl;
       } else if (d.t === 'audio') {
@@ -28267,7 +28698,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       } else if (d.t === 'gl') {
         this.gx.glb = !!d.gl;
       } else if (d.t === 'err') {
-        this.err = d.msg;
+        this.err = d.msg; if (d.log) this.log = d.log;
       } else if (d.t === 'stopped') {
         if (this.onStopped) this.onStopped();
       }
@@ -34977,6 +35408,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
           if (!(srcObj instanceof Uint8Array) && srcObj && typeof srcObj.slice === 'function' && (srcObj.size > 0x4000000 || /\.(nsp|xci)$/i.test(name))) {
             const pkg = await nxStreamExtractPackage(srcObj, prodKeysNx);
             bytes = pkg.exefs; romfsNx = pkg.romfs; romfsStreamNx = pkg.romfsStream; programIdNx = pkg.programId || 0n;
+            // archivo por URL (no un Blob): al Worker solo la URL y el tamano (lo lee con peticiones Range)
+            if (romfsStreamNx && romfsStreamNx.file && romfsStreamNx.file.url && !(typeof Blob !== 'undefined' && romfsStreamNx.file instanceof Blob)) romfsStreamNx = Object.assign({}, romfsStreamNx, { file: { url: romfsStreamNx.file.url, size: romfsStreamNx.file.size } });
           } else {
             bytes = srcObj instanceof Uint8Array ? srcObj : new Uint8Array(await srcObj.arrayBuffer());
           }
@@ -36863,6 +37296,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // una version nueva (al acabar la animacion de entrada) y siempre con la insignia de debajo del logo.
   const NGBSN_VERSION = NGBSN_ENGINE_VERSION;
   const NGBSN_CHANGELOG = [
+    { v: '7.42', f: '27-11-2026', t: 'Switch: GPU más rápida (trabajo de Gemini)', i: [
+      'Las macros de la GPU de la Switch se convierten en funciones de JavaScript en vez de interpretarse orden a orden, y las copias de memoria de la GPU van directas: en Super Mario 3D All-Stars las copias son unas 10 veces más rápidas y el conjunto un 17 % más rápido.',
+      'La lista de órdenes de la GPU se lee directamente de la memoria y las órdenes del motor 3D van por un camino más corto.'] },
+    { v: '7.41', f: '27-11-2026', t: 'Switch: traductor más ligero y sin pararse si falla WebGL', i: [
+      'El procesador de la Switch traduce menos código y en bloques más cortos: al cargar un juego grande (Super Mario 3D All-Stars) se pasaba un tercio del tiempo traduciendo código que casi no se usa. En las pruebas avanza alrededor de un 20 % más.',
+      'Si el navegador reinicia la GPU (contexto WebGL perdido), la Switch crea uno nuevo o sigue por software en vez de pararse.'] },
     { v: '7.40', f: '26-11-2026', t: 'Ratatouille (GameCube y Wii) mucho más rápido', i: [
       'GameCube y Wii vuelven a usar dos hilos (procesador y gráficos a la vez) también en Ratatouille. Antes iba en uno solo porque salían formas gigantes amarillas: el hilo de gráficos leía los vértices como estaban al final del fotograma. Ahora el hilo del procesador le manda una copia de lo que el juego tenía en cada momento. Ratatouille de GameCube pasa de unos 40 a unos 60 fps.',
       'Velocidad automática: si el ordenador no llega, el procesador emulado hace algo menos de trabajo por fotograma (como el «underclock» de Dolphin), para que el juego vaya a su velocidad en vez de a cámara lenta. El contador de FPS muestra «CPU 72 %» cuando está activa; si sobra tiempo, vuelve sola al 100 %.',
